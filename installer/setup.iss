@@ -5,7 +5,7 @@
 ; ---------------------------------------------------------------------------
 
 #define MyAppName      "BIM-Agent Studio"
-#define MyAppVersion   "1.0.0"
+#define MyAppVersion   "1.2.0"
 #define MyAppPublisher "BIM-Agent Studio Team"
 #define MyAppURL       "https://github.com/bim-agent-studio"
 #define MyAppExeName   "BIM-Agent-Studio.exe"

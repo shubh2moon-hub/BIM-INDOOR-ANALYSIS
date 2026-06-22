@@ -16,7 +16,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 APP_NAME = "BIM-Agent-Studio"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 MAIN_SCRIPT = "app.py"
 ICON_PATH = os.path.join("assets", "icon.ico")
 

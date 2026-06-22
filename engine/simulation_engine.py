@@ -1,11 +1,23 @@
 """
 Agent-Based Simulation Engine
 Powered by Mesa for agent-based modeling and simulation.
+
+v2.0 Enhancements (inspired by JuPedSim):
+- Multiple pedestrian dynamics models (Social Force, Collision-Free Speed,
+  Anticipation Velocity, Generalized Centrifugal Force)
+- Journey / Stage system for complex routing (waypoints, waiting, flow limits)
+- Proper wall/obstacle avoidance with geometry-based repulsion
+- Per-agent movement parameters
+- Batch simulation support for statistical robustness
+- Benchmark scenarios (RiMEA-inspired)
+- Flow limitation and queueing support
 """
 
 import uuid
 import random
 import logging
+import copy
+import math
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,9 +31,7 @@ from mesa.datacollection import DataCollector
 try:
     from mesa.time import SimultaneousActivation
 except ImportError:
-    # Mesa 3.x removed mesa.time — use a simple list-based scheduler shim
     class SimultaneousActivation:
-        """Minimal drop-in for Mesa 3.x where mesa.time was removed."""
         def __init__(self, model):
             self.model = model
             self._agents: dict = {}
@@ -47,14 +57,25 @@ except ImportError:
 try:
     from mesa.space import ContinuousSpace
 except ImportError:
-    ContinuousSpace = None  # not critical — we skip placement if unavailable
+    ContinuousSpace = None
 
 from core.bim_processor import BIMModel, BIMSpace, BIMElement, ElementCategory
 from core.spatial_engine import SpatialGraph, SpatialIntelligenceEngine
+from engine.pedestrian_models import (
+    PedestrianModel, AgentMovementParams, WallSegment, get_model, list_models
+)
+from engine.journey_system import (
+    Journey, Stage, WaypointStage, WaitStage, FlowLimitStage, EvacuateStage,
+    DirectSteeringStage, StageResult, StageState
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Enums (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 class AgentType(Enum):
     HUMAN = "human"
@@ -81,7 +102,12 @@ class AgentState(Enum):
     EVACUATING = "evacuating"
     INTERACTING = "interacting"
     DISABLED = "disabled"
+    QUEUING = "queuing"
 
+
+# ---------------------------------------------------------------------------
+# Agent Profile
+# ---------------------------------------------------------------------------
 
 @dataclass
 class AgentProfile:
@@ -90,32 +116,52 @@ class AgentProfile:
     name: str
     agent_type: AgentType
     role: Optional[HumanRole] = None
-    
+
     # Movement properties
     base_speed: float = 1.2  # m/s
     max_speed: float = 1.5
     acceleration: float = 0.5
     turn_rate: float = 90.0  # degrees
-    
+
     # Behavior properties
     patience: float = 0.5  # 0-1
     sociability: float = 0.5  # 0-1
     risk_tolerance: float = 0.5  # 0-1
     destination_preference: List[str] = field(default_factory=list)
-    
+
     # Physical properties
     size: float = 0.5  # meters radius
     vision_range: float = 10.0  # meters
-    
+
     # Schedule
     schedule: Dict[float, str] = field(default_factory=dict)  # time -> activity
-    
+
     # Special attributes
     needs_accessible: bool = False
     can_use_stairs: bool = True
     can_use_elevator: bool = True
     group_id: Optional[str] = None
 
+    # NEW v2.0: Movement model selection
+    movement_model: str = "basic"  # basic, social_force, collision_free_speed, anticipation_velocity, generalized_centrifugal_force
+    movement_params: AgentMovementParams = field(default_factory=AgentMovementParams)
+
+    # NEW v2.0: Journey for complex routing
+    journey: Optional[Journey] = None
+
+    def __post_init__(self):
+        # Sync legacy fields into movement_params
+        if self.movement_params.desired_speed == 1.34 and self.base_speed != 1.34:
+            self.movement_params.desired_speed = self.base_speed
+        if self.movement_params.max_speed == 2.0 and self.max_speed != 2.0:
+            self.movement_params.max_speed = self.max_speed
+        if self.movement_params.radius == 0.25 and self.size != 0.25:
+            self.movement_params.radius = self.size
+
+
+# ---------------------------------------------------------------------------
+# Simulation Scenario
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SimulationScenario:
@@ -125,20 +171,27 @@ class SimulationScenario:
     description: str
     duration: int  # steps
     time_step: float = 1.0  # seconds per step
-    
+
     # Agent definitions
     agent_profiles: List[AgentProfile] = field(default_factory=list)
     agent_counts: Dict[str, int] = field(default_factory=dict)
-    
+
     # Events
     events: List[Dict] = field(default_factory=list)
-    
+
     # Environment
     environmental_conditions: Dict[str, Any] = field(default_factory=dict)
-    
+
     # Goals
     goals: Dict[str, Any] = field(default_factory=dict)
 
+    # NEW v2.0: Model selection for the whole scenario
+    default_movement_model: str = "basic"
+
+
+# ---------------------------------------------------------------------------
+# Simulation Metrics
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SimulationMetrics:
@@ -153,11 +206,19 @@ class SimulationMetrics:
     congestion_points: List[Tuple] = field(default_factory=list)
     social_interactions: int = 0
     evacuation_progress: float = 0.0
+    # NEW v2.0
+    agents_queuing: int = 0
+    avg_density: float = 0.0
+    flow_rate: float = 0.0  # agents per second through exits
 
+
+# ---------------------------------------------------------------------------
+# BIMAgent
+# ---------------------------------------------------------------------------
 
 class BIMAgent(Agent):
-    """Base agent class for BIM simulation."""
-    
+    """Base agent class for BIM simulation with JuPedSim-inspired movement."""
+
     def __init__(self, unique_id: int, model: 'BIMSimulationModel', profile: AgentProfile):
         super().__init__(unique_id, model)
         self.profile = profile
@@ -174,16 +235,28 @@ class BIMAgent(Agent):
         self.state_history = []
         self.position_history = []
         self.speed_history = []
-        
+
         # Current speed (can vary)
         self.current_speed = profile.base_speed
-        
+
         # Group behavior
         self.group_members = []
-        
+
+        # NEW v2.0: Movement model instance
+        self._movement_model: PedestrianModel = get_model(profile.movement_model)
+        self._movement_params: AgentMovementParams = copy.deepcopy(profile.movement_params)
+
+        # NEW v2.0: Journey tracking
+        self._journey_index: int = 0
+        if profile.journey:
+            profile.journey.reset()
+
+        # NEW v2.0: Waiting state
+        self._wait_timer: float = 0.0
+        self._flow_wait: bool = False
+
     def step(self):
         """Execute one step of the agent."""
-        # Record state — schedule.steps attr differs between Mesa versions
         current_step = getattr(getattr(self, 'model', None), '_step_count', 0)
         if hasattr(self.model, 'schedule') and hasattr(self.model.schedule, 'steps'):
             current_step = self.model.schedule.steps
@@ -192,12 +265,17 @@ class BIMAgent(Agent):
             "step": current_step,
             "state": self.state.value,
             "position": tuple(self.position),
-            "speed": self.current_speed
+            "speed": float(self.current_speed)
         })
         self.position_history.append(tuple(self.position))
-        self.speed_history.append(self.current_speed)
-        
-        # Execute behavior based on state
+        self.speed_history.append(float(self.current_speed))
+
+        # NEW v2.0: Journey takes precedence over simple state machine
+        if self.profile.journey and self._journey_index < len(self.profile.journey.stages):
+            self._process_journey()
+            return
+
+        # Legacy behavior based on state
         if self.state == AgentState.IDLE:
             self._behavior_idle()
         elif self.state == AgentState.MOVING:
@@ -210,10 +288,53 @@ class BIMAgent(Agent):
             self._behavior_evacuating()
         elif self.state == AgentState.INTERACTING:
             self._behavior_interacting()
-            
+        elif self.state == AgentState.QUEUING:
+            self._behavior_queuing()
+
+    # ------------------------------------------------------------------
+    # Journey processing (NEW v2.0)
+    # ------------------------------------------------------------------
+
+    def _process_journey(self):
+        """Process the current journey stage."""
+        journey = self.profile.journey
+        stage = journey.stages[self._journey_index]
+        result = stage.update(self, self.model.time_step)
+
+        if result.state == StageState.COMPLETED and result.next_stage:
+            self._journey_index += 1
+            if self._journey_index >= len(journey.stages):
+                # Journey complete
+                self.state = AgentState.IDLE
+                self.velocity = np.zeros(3)
+            else:
+                # Reset next stage and continue
+                journey.stages[self._journey_index].reset()
+                self._process_journey()
+            return
+
+        if result.state == StageState.ACTIVE:
+            if result.wait_duration > 0:
+                self.state = AgentState.WAITING
+                self._wait_timer = result.wait_duration
+                self.velocity = np.zeros(3)
+            elif result.flow_limit < float('inf'):
+                self.state = AgentState.QUEUING
+            elif result.destination:
+                self.destination = result.destination
+                self.state = AgentState.MOVING
+                self._behavior_moving()
+            elif result.metadata.get("direct_target") is not None:
+                target = np.array(result.metadata["direct_target"])
+                self._move_toward_point(target)
+            return
+
+    # ------------------------------------------------------------------
+    # Behaviors
+    # ------------------------------------------------------------------
+
     def _behavior_idle(self):
         """Behavior when idle - decide next action."""
-        # Check schedule
         current_time = self.model.current_time
         if current_time in self.profile.schedule:
             activity = self.profile.schedule[current_time]
@@ -226,194 +347,245 @@ class BIMAgent(Agent):
                 self.state = AgentState.EVACUATING
                 self._set_evacuation_destination()
         else:
-            # Random behavior
             if random.random() < 0.1 and self.destination:
                 self.state = AgentState.MOVING
                 self._plan_path()
-                
+
     def _behavior_moving(self):
-        """Behavior when moving along path."""
-        if not self.path:
+        """Behavior when moving along path using pedestrian model."""
+        if not self.path and not self.destination:
             self.state = AgentState.IDLE
             return
-            
-        # Move towards next waypoint
-        target = np.array(self.path[0])
+
+        # If no path, plan one
+        if not self.path and self.destination:
+            self._plan_path()
+            if not self.path:
+                return
+
+        # Get target waypoint
+        target = np.array(self.path[0]) if self.path else np.array([0.0, 0.0, 0.0])
         direction = target - self.position
         distance = np.linalg.norm(direction)
-        
+
         if distance < 0.5:  # Reached waypoint
             self.path.pop(0)
             if not self.path:
                 self.state = AgentState.IDLE
-                self.velocity = np.array([0.0, 0.0, 0.0])
+                self.velocity = np.zeros(3)
                 return
             target = np.array(self.path[0])
             direction = target - self.position
             distance = np.linalg.norm(direction)
-        
-        # Normalize and apply speed
-        if distance > 0:
-            direction = direction / distance
-            
-            # Avoid other agents (simple collision avoidance)
-            avoidance = self._calculate_avoidance()
-            direction = direction + avoidance
-            direction = direction / (np.linalg.norm(direction) + 1e-6)
-            
-            # Apply speed with variation
-            self.current_speed = min(
-                self.profile.base_speed * (0.8 + random.random() * 0.4),
-                self.profile.max_speed
-            )
-            
-            # Reduce speed in crowds
-            nearby_agents = self._count_nearby_agents(2.0)
-            if nearby_agents > 3:
-                self.current_speed *= max(0.3, 1.0 - nearby_agents * 0.15)
-            
-            self.velocity = direction * self.current_speed
-            new_position = self.position + self.velocity * self.model.time_step
-            
-            # Update position
-            self.position = new_position
-            self.traveled_distance += np.linalg.norm(self.velocity) * self.model.time_step
-            self.travel_time += self.model.time_step
-            
-            # Update current space
-            self._update_current_space()
-            
+
+        # Normalize desired direction
+        desired_direction = direction / (distance + EPS)
+
+        # NEW v2.0: Use pedestrian dynamics model for acceleration
+        acceleration = self._compute_acceleration(desired_direction)
+
+        # Integrate velocity
+        self.velocity += acceleration * self.model.time_step
+
+        # Clamp speed
+        speed = np.linalg.norm(self.velocity)
+        max_speed = self._movement_params.max_speed
+
+        # Density-dependent speed reduction (Weidmann-like)
+        nearby = self._count_nearby_agents(2.0)
+        if nearby > 0:
+            # Simple density-speed relationship: v = v0 * exp(-alpha * density)
+            # Approximate local density from nearby count
+            local_density = nearby / (np.pi * 2.0 * 2.0)  # agents per m² in 2m radius
+            max_speed *= max(0.1, math.exp(-0.5 * local_density))
+
+        if speed > max_speed:
+            self.velocity = (self.velocity / speed) * max_speed
+
+        # Update position
+        new_position = self.position + self.velocity * self.model.time_step
+
+        # Wall collision constraint (soft)
+        new_position = self._apply_wall_constraint(new_position)
+
+        self.position = new_position
+        self.current_speed = float(np.linalg.norm(self.velocity))
+        self.traveled_distance += self.current_speed * self.model.time_step
+        self.travel_time += self.model.time_step
+
+        self._update_current_space()
+
     def _behavior_waiting(self):
         """Behavior when waiting."""
         self.waiting_time += self.model.time_step
-        self.velocity = np.array([0.0, 0.0, 0.0])
-        
-        # Check if wait is over
-        if self.waiting_time > 30:  # Max 30 seconds wait
+        self.velocity = np.zeros(3)
+        self._wait_timer -= self.model.time_step
+
+        if self._wait_timer <= 0:
             self.state = AgentState.IDLE
-            
+
+    def _behavior_queuing(self):
+        """Behavior when queuing (NEW v2.0)."""
+        self.velocity = np.zeros(3)
+        # Agent remains in place, waiting for flow permission
+        # The FlowLimitStage handles timing via the model's claim_flow_time
+
     def _behavior_working(self):
         """Behavior when working."""
-        self.velocity = np.array([0.0, 0.0, 0.0])
-        # Work for a duration then become idle
+        self.velocity = np.zeros(3)
         if random.random() < 0.01:
             self.state = AgentState.IDLE
-            
+
     def _behavior_evacuating(self):
         """Behavior during evacuation."""
         if not self.destination:
             self._set_evacuation_destination()
-            
         if not self.path:
             self._plan_path()
-            
         if self.path:
             # Move faster during evacuation
-            self.profile.base_speed = min(self.profile.max_speed * 1.2, 2.0)
+            self._movement_params.desired_speed = min(self.profile.max_speed * 1.2, 2.0)
             self._behavior_moving()
         else:
-            # Reached exit
             self.state = AgentState.DISABLED
             self.model.evacuated_agents += 1
-            
+
     def _behavior_interacting(self):
         """Behavior when interacting with other agents."""
-        self.velocity = np.array([0.0, 0.0, 0.0])
+        self.velocity = np.zeros(3)
         self.interactions += 1
-        
-        # Interaction lasts for a few steps
         if random.random() < 0.1:
             self.state = AgentState.IDLE
-            
+
+    # ------------------------------------------------------------------
+    # NEW v2.0: Physics-based movement
+    # ------------------------------------------------------------------
+
+    def _compute_acceleration(self, desired_direction: np.ndarray) -> np.ndarray:
+        """Compute acceleration using the selected pedestrian dynamics model."""
+        neighbors = self._get_neighbor_info()
+        walls = self._get_nearby_walls()
+
+        return self._movement_model.compute_velocity_change(
+            agent_position=self.position,
+            agent_velocity=self.velocity,
+            params=self._movement_params,
+            desired_direction=desired_direction,
+            neighbors=neighbors,
+            walls=walls,
+            time_step=self.model.time_step
+        )
+
+    def _get_neighbor_info(self) -> List[Tuple[np.ndarray, np.ndarray, AgentMovementParams]]:
+        """Get nearby agents as (position, velocity, params) tuples."""
+        neighbors = []
+        vision = self._movement_params.radius * 4 + 2.0  # neighbor search radius
+        for agent in self.model._get_all_agents():
+            if agent != self:
+                dist = np.linalg.norm(self.position - agent.position)
+                if dist < vision:
+                    # Use agent's own params if it has them, else default
+                    other_params = getattr(agent, '_movement_params', AgentMovementParams(radius=agent.profile.size))
+                    neighbors.append((agent.position.copy(), agent.velocity.copy(), other_params))
+        return neighbors
+
+    def _get_nearby_walls(self) -> List[WallSegment]:
+        """Get wall segments near the agent."""
+        return self.model._get_wall_segments_near(self.position, radius=3.0)
+
+    def _apply_wall_constraint(self, position: np.ndarray) -> np.ndarray:
+        """Soft constraint: push agent away from walls if it overlaps."""
+        walls = self.model._get_wall_segments_near(position, radius=1.0)
+        correction = np.zeros(3)
+        for wall in walls:
+            nearest = self._movement_model._nearest_point_on_segment(position, wall)
+            diff = position - nearest
+            dist = np.linalg.norm(diff) + EPS
+            if dist < self._movement_params.radius:
+                # Push out along normal
+                push = (self._movement_params.radius - dist) * (diff / dist)
+                correction += push
+        return position + correction
+
+    def _move_toward_point(self, target: np.ndarray):
+        """Direct steering toward a point (used by DirectSteeringStage)."""
+        direction = target - self.position
+        distance = np.linalg.norm(direction)
+        if distance < 0.5:
+            return
+        desired_direction = direction / distance
+        acceleration = self._compute_acceleration(desired_direction)
+        self.velocity += acceleration * self.model.time_step
+        speed = np.linalg.norm(self.velocity)
+        if speed > self._movement_params.max_speed:
+            self.velocity = (self.velocity / speed) * self._movement_params.max_speed
+        self.position = self.position + self.velocity * self.model.time_step
+        self._update_current_space()
+
+    # ------------------------------------------------------------------
+    # Path planning
+    # ------------------------------------------------------------------
+
     def _plan_path(self):
         """Plan path to destination using spatial graph."""
         if not self.destination or not self.model.spatial_engine:
             return
-            
         current_space = self.current_space
         if not current_space:
             return
-            
-        # Find path through spaces
-        path = self.model.spatial_engine.find_shortest_path(
-            current_space,
-            self.destination
-        )
-        
+        path = self.model.spatial_engine.find_shortest_path(current_space, self.destination)
         if path:
-            # Convert space path to waypoints
             self.path = []
-            for node_id in path[1:]:  # Skip current space
+            for node_id in path[1:]:
                 space_id = node_id.replace("space_", "")
                 if space_id in self.model.bim_model.spaces:
                     space = self.model.bim_model.spaces[space_id]
                     if space.center:
                         self.path.append(space.center)
-                        
+
     def _set_evacuation_destination(self):
         """Set nearest exit as destination during evacuation."""
         if not self.model.bim_model:
             return
-            
-        # Find nearest exit (space with category "entrance" or "exit")
         exits = [
             s for s in self.model.bim_model.spaces.values()
             if s.category in ["entrance", "exit", "lobby", "public"]
         ]
-        
         if exits:
-            # Find closest exit
             closest = min(exits, key=lambda e: self._distance_to(e.center))
             self.destination = closest.id
-            
-    def _calculate_avoidance(self) -> np.ndarray:
-        """Calculate avoidance vector from nearby agents."""
-        avoidance = np.array([0.0, 0.0, 0.0])
-        
-        for agent in self.model.schedule.agents:
-            if agent != self:
-                diff = self.position - agent.position
-                dist = np.linalg.norm(diff)
-                if 0 < dist < self.profile.size * 3:
-                    force = (self.profile.size * 3 - dist) / (self.profile.size * 3)
-                    avoidance += (diff / (dist + 1e-6)) * force
-                    
-        return avoidance * 0.5
-        
-    def _count_nearby_agents(self, radius: float) -> int:
-        """Count agents within radius."""
-        count = 0
-        for agent in self.model.schedule.agents:
-            if agent != self:
-                dist = np.linalg.norm(self.position - agent.position)
-                if dist < radius:
-                    count += 1
-        return count
-        
+
     def _update_current_space(self):
         """Update which space the agent is currently in."""
         if not self.model.bim_model:
             return
-            
         closest_space = None
         closest_dist = float('inf')
-        
         for space in self.model.bim_model.spaces.values():
             if space.center:
                 dist = self._distance_to(space.center)
                 if dist < closest_dist:
                     closest_dist = dist
                     closest_space = space.id
-                    
         if closest_space:
             self.current_space = closest_space
-            
+
     def _distance_to(self, point: Optional[Tuple]) -> float:
         """Calculate distance to a point."""
         if not point:
             return float('inf')
-        return np.linalg.norm(self.position - np.array(point))
-        
+        return float(np.linalg.norm(self.position - np.array(point)))
+
+    def _count_nearby_agents(self, radius: float) -> int:
+        """Count agents within radius."""
+        count = 0
+        for agent in self.model._get_all_agents():
+            if agent != self:
+                dist = np.linalg.norm(self.position - agent.position)
+                if dist < radius:
+                    count += 1
+        return count
+
     def get_metrics(self) -> Dict:
         """Get agent metrics."""
         return {
@@ -427,13 +599,18 @@ class BIMAgent(Agent):
             "travel_time": self.travel_time,
             "waiting_time": self.waiting_time,
             "interactions": self.interactions,
-            "current_speed": self.current_speed
+            "current_speed": self.current_speed,
+            "movement_model": self.profile.movement_model,
         }
 
 
+# ---------------------------------------------------------------------------
+# BIMSimulationModel
+# ---------------------------------------------------------------------------
+
 class BIMSimulationModel(Model):
-    """Mesa model for BIM agent-based simulation."""
-    
+    """Mesa model for BIM agent-based simulation with JuPedSim-inspired features."""
+
     def __init__(
         self,
         bim_model: BIMModel,
@@ -448,111 +625,179 @@ class BIMSimulationModel(Model):
         self.scenario = scenario
         self.width = width
         self.height = height
-        
+
         # Time tracking
         self.current_time = 0.0
         self.time_step = scenario.time_step
         self.max_steps = scenario.duration
-        
+
         # Spatial setup
         self.space = ContinuousSpace(width, height, torus=False)
-        
+
         # Schedule
         self.schedule = SimultaneousActivation(self)
-        
-        # Agent tracking — use _agent_registry to avoid conflict with
-        # Mesa 2.4+ which reserves model.agents as an AgentSet
+
+        # Agent tracking
         self._agent_registry: Dict[int, BIMAgent] = {}
         self.evacuated_agents = 0
         self.next_agent_id = 0
-        
+
         # Events
         self.pending_events = sorted(scenario.events, key=lambda e: e.get("time", 0))
         self.completed_events = []
-        
+
         # Metrics collection
         self.metrics_history: List[SimulationMetrics] = []
         self.social_interactions = 0
         self.congestion_events = []
-        
-        # Density map (space_id -> agent count)
+
+        # Density map
         self.density_map: Dict[str, int] = {}
-        
+
+        # NEW v2.0: Wall segment cache for fast lookup
+        self._wall_segments: List[WallSegment] = []
+        self._wall_spatial_index: Dict[str, List[WallSegment]] = {}
+        self._build_wall_cache()
+
+        # NEW v2.0: Flow limitation tracking (space_id -> next available time)
+        self._flow_limits: Dict[str, float] = {}
+
         # Data collector
         self.datacollector = DataCollector(
             model_reporters={
-                "Agent Count": lambda m: len(m.schedule.agents),
+                "Agent Count": lambda m: len(m._get_all_agents()),
                 "Moving": self._count_moving_agents,
                 "Waiting": self._count_waiting_agents,
+                "Evacuated": lambda m: m.evacuated_agents,
+                "Queuing": self._count_queuing_agents,
                 "Avg Speed": self._get_avg_speed,
-                "Evacuated": lambda m: m.evacuated_agents
             },
             agent_reporters={
                 "State": lambda a: a.state.value,
                 "Speed": lambda a: a.current_speed,
                 "Distance": lambda a: a.traveled_distance,
-                "Space": lambda a: a.current_space
+                "Space": lambda a: a.current_space,
+                "Model": lambda a: a.profile.movement_model,
             }
         )
-        
+
         # Initialize agents
         self._initialize_agents()
-        
-        logger.info(f"Simulation model initialized: {len(self.schedule.agents)} agents")
-        
+
+        logger.info(f"Simulation model initialized: {len(self._get_all_agents())} agents, model={scenario.default_movement_model}")
+
+    # ------------------------------------------------------------------
+    # Wall cache (NEW v2.0)
+    # ------------------------------------------------------------------
+
+    def _build_wall_cache(self):
+        """Precompute wall segments from BIM elements."""
+        if not self.bim_model:
+            return
+
+        walls = []
+        for elem in self.bim_model.elements.values():
+            if elem.category == ElementCategory.WALL and elem.bounds:
+                (min_x, min_y, min_z), (max_x, max_y, max_z) = elem.bounds
+                # Create edge segments from the bounding box (2D approximation)
+                edges = [
+                    (np.array([min_x, min_y, min_z]), np.array([max_x, min_y, min_z])),
+                    (np.array([max_x, min_y, min_z]), np.array([max_x, max_y, min_z])),
+                    (np.array([max_x, max_y, min_z]), np.array([min_x, max_y, min_z])),
+                    (np.array([min_x, max_y, min_z]), np.array([min_x, min_y, min_z])),
+                ]
+                for p1, p2 in edges:
+                    walls.append(WallSegment(p1, p2))
+
+        self._wall_segments = walls
+        logger.info(f"Wall cache built: {len(walls)} segments")
+
+    def _get_wall_segments_near(self, position: np.ndarray, radius: float = 3.0) -> List[WallSegment]:
+        """Return wall segments within radius of position."""
+        # Simple O(N) check; for very large models a spatial index would help
+        nearby = []
+        for wall in self._wall_segments:
+            nearest = self._nearest_point_on_segment(position, wall)
+            if np.linalg.norm(position - nearest) < radius + 0.5:
+                nearby.append(wall)
+        return nearby
+
+    @staticmethod
+    def _nearest_point_on_segment(point: np.ndarray, wall: WallSegment) -> np.ndarray:
+        t = np.dot(point - wall.p1, wall.unit)
+        t = max(0.0, min(wall.length, t))
+        return wall.p1 + t * wall.unit
+
+    # ------------------------------------------------------------------
+    # Flow limitation (NEW v2.0)
+    # ------------------------------------------------------------------
+
+    def claim_flow_time(self, space_id: str, max_flow_rate: float) -> Optional[float]:
+        """
+        Claim a time slot to pass through a flow-limited space.
+        Returns the earliest allowed time, or None if cannot claim.
+        """
+        now = self.current_time
+        interval = 1.0 / max_flow_rate if max_flow_rate > 0 else 0.0
+        last_time = self._flow_limits.get(space_id, now - interval)
+        next_time = max(now, last_time + interval)
+        self._flow_limits[space_id] = next_time
+        return next_time
+
+    # ------------------------------------------------------------------
+    # Agent initialization
+    # ------------------------------------------------------------------
+
     def _initialize_agents(self):
         """Create agents based on scenario."""
         for profile in self.scenario.agent_profiles:
             count = self.scenario.agent_counts.get(profile.id, 1)
             for _ in range(count):
                 self._create_agent(profile)
-                
+
     def _create_agent(self, profile: AgentProfile, position: Optional[Tuple] = None) -> BIMAgent:
         """Create a new agent in the simulation."""
         agent_id = self.next_agent_id
         self.next_agent_id += 1
-        
+
         agent = BIMAgent(agent_id, self, profile)
-        
+
         # Set initial position
         if position:
-            agent.position = np.array(position)
+            agent.position = np.array(position, dtype=float)
         else:
-            # Random position in a random space
             if self.bim_model and self.bim_model.spaces:
                 space = random.choice(list(self.bim_model.spaces.values()))
                 if space.center:
                     agent.position = np.array([
                         space.center[0] + random.uniform(-2, 2),
                         space.center[1] + random.uniform(-2, 2),
-                        space.center[2] if len(space.center) > 2 else 0
-                    ])
+                        space.center[2] if len(space.center) > 2 else 0.0
+                    ], dtype=float)
                     agent.current_space = space.id
-                    
+
         self.schedule.add(agent)
         self._agent_registry[agent_id] = agent
-        
-        # Place on continuous space
+
         try:
             self.space.place_agent(agent, (agent.position[0], agent.position[1]))
         except Exception:
             pass
-            
+
         return agent
-        
+
     # ------------------------------------------------------------------
     # Mesa-version-safe agent iterator
     # ------------------------------------------------------------------
+
     def _get_all_agents(self) -> list:
         """Return all active agents, compatible with Mesa 2.x and 3.x."""
         sched = self.schedule
-        # Mesa 2.4+ AgentSet via .agents property or our shim
         if hasattr(sched, 'agents'):
             try:
                 return list(sched.agents)
             except Exception:
                 pass
-        # Older Mesa 2.x SimultaneousActivation stores in ._agents dict
         if hasattr(sched, '_agents'):
             if isinstance(sched._agents, dict):
                 return list(sched._agents.values())
@@ -560,50 +805,39 @@ class BIMSimulationModel(Model):
                 return list(sched._agents)
             except Exception:
                 pass
-        # Last fallback: our own registry dict
         return list(self._agent_registry.values())
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
 
     def step(self):
         """Execute one simulation step."""
-        # Update time
         self.current_time += self.time_step
-        
-        # Process events
         self._process_events()
-        
-        # Execute agent steps
         self.schedule.step()
-        
-        # Update density map
         self._update_density_map()
-        
-        # Detect congestion
         self._detect_congestion()
-        
-        # Detect social interactions
         self._detect_interactions()
-        
-        # Collect metrics
         self._collect_metrics()
         self.datacollector.collect(self)
-        
+
     def _process_events(self):
         """Process scheduled events."""
         events_to_trigger = [
             e for e in self.pending_events
             if e.get("time", 0) <= self.current_time
         ]
-        
         for event in events_to_trigger:
             self._trigger_event(event)
             self.pending_events.remove(event)
             self.completed_events.append(event)
-            
+
     def _trigger_event(self, event: Dict):
         """Trigger a simulation event."""
         event_type = event.get("type", "")
         logger.info(f"Triggering event: {event_type} at time {self.current_time}")
-        
+
         if event_type == "spawn_agents":
             self._event_spawn_agents(event)
         elif event_type == "evacuate":
@@ -614,55 +848,47 @@ class BIMSimulationModel(Model):
             self._event_block_path(event)
         elif event_type == "set_destination":
             self._event_set_destination(event)
-            
+        elif event_type == "set_journey":
+            self._event_set_journey(event)
+        elif event_type == "switch_model":
+            self._event_switch_model(event)
+
     def _event_spawn_agents(self, event: Dict):
-        """Spawn new agents at specified location."""
         profile_id = event.get("profile_id", "")
         count = event.get("count", 1)
         location = event.get("location")
-        
         profile = next(
             (p for p in self.scenario.agent_profiles if p.id == profile_id),
             None
         )
-        
         if profile:
             for _ in range(count):
                 self._create_agent(profile, location)
-                
+
     def _event_evacuate(self, event: Dict):
-        """Trigger evacuation for all agents."""
         for agent in self._get_all_agents():
             agent.state = AgentState.EVACUATING
             agent._set_evacuation_destination()
-            
+
     def _event_fire(self, event: Dict):
-        """Simulate fire in specified location."""
         location = event.get("location")
         spread_rate = event.get("spread_rate", 1.0)
-        
-        # Block affected areas
         if location and self.spatial_engine and self.spatial_engine.spatial_graph:
             for node_id, node in self.spatial_engine.spatial_graph.nodes.items():
-                dist = np.linalg.norm(
-                    np.array(node.center) - np.array(location)
-                )
+                dist = np.linalg.norm(np.array(node.center) - np.array(location))
                 if dist < 10.0 * spread_rate:
                     node.attributes["on_fire"] = True
-                    
+
     def _event_block_path(self, event: Dict):
-        """Block a path or space."""
         space_id = event.get("space_id")
         if space_id and self.spatial_engine and self.spatial_engine.spatial_graph:
             node_id = f"space_{space_id}"
             if node_id in self.spatial_engine.spatial_graph.nodes:
                 self.spatial_engine.spatial_graph.nodes[node_id].attributes["blocked"] = True
-                
+
     def _event_set_destination(self, event: Dict):
-        """Set destination for specific agents."""
         agent_filter = event.get("filter", {})
         destination = event.get("destination")
-        
         for agent in self._get_all_agents():
             match = True
             for key, value in agent_filter.items():
@@ -672,19 +898,52 @@ class BIMSimulationModel(Model):
             if match:
                 agent.destination = destination
                 agent.state = AgentState.IDLE
-                
+
+    # NEW v2.0
+    def _event_set_journey(self, event: Dict):
+        """Assign a journey to matching agents."""
+        agent_filter = event.get("filter", {})
+        journey = event.get("journey")
+        if not journey:
+            return
+        for agent in self._get_all_agents():
+            match = True
+            for key, value in agent_filter.items():
+                if getattr(agent.profile, key, None) != value:
+                    match = False
+                    break
+            if match:
+                agent.profile.journey = journey
+                agent._journey_index = 0
+                journey.reset()
+
+    # NEW v2.0
+    def _event_switch_model(self, event: Dict):
+        """Switch movement model for agents."""
+        agent_filter = event.get("filter", {})
+        model_name = event.get("model", "basic")
+        for agent in self._get_all_agents():
+            match = True
+            for key, value in agent_filter.items():
+                if getattr(agent.profile, key, None) != value:
+                    match = False
+                    break
+            if match:
+                agent.profile.movement_model = model_name
+                agent._movement_model = get_model(model_name)
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
     def _update_density_map(self):
-        """Update the density map of spaces."""
         self.density_map = {}
         for agent in self._get_all_agents():
             if agent.current_space:
-                self.density_map[agent.current_space] = \
-                    self.density_map.get(agent.current_space, 0) + 1
-                    
+                self.density_map[agent.current_space] = self.density_map.get(agent.current_space, 0) + 1
+
     def _detect_congestion(self):
-        """Detect congestion points in the building."""
-        congestion_threshold = 3  # agents per square meter
-        
+        congestion_threshold = 3.0
         for space_id, count in self.density_map.items():
             if space_id in self.bim_model.spaces:
                 space = self.bim_model.spaces[space_id]
@@ -698,77 +957,85 @@ class BIMSimulationModel(Model):
                             "density": density,
                             "agent_count": count
                         })
-                        
+
     def _detect_interactions(self):
-        """Detect social interactions between agents."""
-        interaction_distance = 2.0  # meters
-        
+        interaction_distance = 2.0
         agents_list = self._get_all_agents()
         for i in range(len(agents_list)):
             for j in range(i + 1, len(agents_list)):
                 a1 = agents_list[i]
                 a2 = agents_list[j]
-                
                 dist = np.linalg.norm(a1.position - a2.position)
                 if dist < interaction_distance:
-                    # Check if both agents are sociable enough
-                    if (a1.profile.sociability > 0.3 and 
-                        a2.profile.sociability > 0.3):
+                    if a1.profile.sociability > 0.3 and a2.profile.sociability > 0.3:
                         self.social_interactions += 1
-                        if random.random() < 0.1:  # 10% chance to start interacting
+                        if random.random() < 0.1:
                             a1.state = AgentState.INTERACTING
                             a2.state = AgentState.INTERACTING
-                            
+
     def _collect_metrics(self) -> SimulationMetrics:
-        """Collect simulation metrics for current step."""
         agents = self._get_all_agents()
-        
+        total_agents = len(agents)
+
+        # Compute average density across all occupied spaces
+        avg_density = 0.0
+        if self.density_map:
+            densities = []
+            for sid, count in self.density_map.items():
+                if sid in self.bim_model.spaces:
+                    area = self.bim_model.spaces[sid].area
+                    if area > 0:
+                        densities.append(count / area)
+            if densities:
+                avg_density = sum(densities) / len(densities)
+
+        # Compute flow rate (evacuated agents per second over last step)
+        flow_rate = self.evacuated_agents / max(self.current_time, 1.0)
+
         metrics = SimulationMetrics(
             timestamp=getattr(self.schedule, 'steps', int(self.current_time)),
-            agent_count=len(agents),
+            agent_count=total_agents,
             agents_moving=sum(1 for a in agents if a.state == AgentState.MOVING),
             agents_waiting=sum(1 for a in agents if a.state == AgentState.WAITING),
-            avg_speed=sum(a.current_speed for a in agents) / len(agents) if agents else 0,
-            avg_travel_time=sum(a.travel_time for a in agents) / len(agents) if agents else 0,
+            agents_queuing=sum(1 for a in agents if a.state == AgentState.QUEUING),
+            avg_speed=sum(a.current_speed for a in agents) / total_agents if total_agents else 0,
+            avg_travel_time=sum(a.travel_time for a in agents) / total_agents if total_agents else 0,
             density_map={
                 sid: count / self.bim_model.spaces[sid].area
                 for sid, count in self.density_map.items()
                 if sid in self.bim_model.spaces and self.bim_model.spaces[sid].area > 0
             },
             social_interactions=self.social_interactions,
-            evacuation_progress=(self.evacuated_agents / len(agents) * 100) if agents else 0
+            evacuation_progress=(self.evacuated_agents / total_agents * 100) if total_agents else 0,
+            avg_density=avg_density,
+            flow_rate=flow_rate,
         )
-        
         self.metrics_history.append(metrics)
         return metrics
-        
+
     def _count_moving_agents(self) -> int:
-        """Count agents that are currently moving."""
         return sum(1 for a in self._get_all_agents() if a.state == AgentState.MOVING)
-        
+
     def _count_waiting_agents(self) -> int:
-        """Count agents that are waiting."""
         return sum(1 for a in self._get_all_agents() if a.state == AgentState.WAITING)
-        
+
+    def _count_queuing_agents(self) -> int:
+        return sum(1 for a in self._get_all_agents() if a.state == AgentState.QUEUING)
+
     def _get_avg_speed(self) -> float:
-        """Get average speed of all agents."""
         agents = self._get_all_agents()
         return sum(a.current_speed for a in agents) / len(agents) if agents else 0
-        
+
     def get_agent_metrics(self) -> List[Dict]:
-        """Get metrics for all agents."""
         return [agent.get_metrics() for agent in self._get_all_agents()]
-        
+
     def get_space_occupancy(self) -> Dict[str, Dict]:
-        """Get occupancy information for all spaces."""
         occupancy = {}
         for space_id, space in self.bim_model.spaces.items():
             agent_count = self.density_map.get(space_id, 0)
-            # BIMSpace doesn't have a capacity attribute by default, assume 2 sq m per person
             capacity = getattr(space, 'capacity', max(1, space.area / 2.0))
             density = agent_count / space.area if space.area > 0 else 0
             capacity_ratio = agent_count / capacity if capacity > 0 else 0
-            
             occupancy[space_id] = {
                 "space_name": space.name,
                 "agent_count": agent_count,
@@ -778,18 +1045,21 @@ class BIMSimulationModel(Model):
                 "is_overcrowded": capacity_ratio > 1.0
             }
         return occupancy
-        
+
     def get_current_metrics(self) -> SimulationMetrics:
-        """Get current simulation metrics."""
         if self.metrics_history:
             return self.metrics_history[-1]
-        return SimulationMetrics(timestamp=0, agent_count=0, agents_moving=0, 
-                               agents_waiting=0, avg_speed=0, avg_travel_time=0)
+        return SimulationMetrics(timestamp=0, agent_count=0, agents_moving=0,
+                                 agents_waiting=0, avg_speed=0, avg_travel_time=0)
 
+
+# ---------------------------------------------------------------------------
+# SimulationEngine
+# ---------------------------------------------------------------------------
 
 class SimulationEngine:
     """Main simulation engine managing simulation runs."""
-    
+
     def __init__(self):
         self.current_model: Optional[BIMSimulationModel] = None
         self.is_running = False
@@ -797,9 +1067,11 @@ class SimulationEngine:
         self.scenarios: Dict[str, SimulationScenario] = {}
         self.on_step_callbacks: List[Callable] = []
         self.on_complete_callbacks: List[Callable] = []
-        
+
+        # NEW v2.0: Batch results
+        self.batch_results: List[Dict] = []
+
     def create_scenario(self, name: str, description: str, duration: int, **kwargs) -> SimulationScenario:
-        """Create a new simulation scenario."""
         scenario = SimulationScenario(
             id=str(uuid.uuid4()),
             name=name,
@@ -809,7 +1081,7 @@ class SimulationEngine:
         )
         self.scenarios[scenario.id] = scenario
         return scenario
-        
+
     def add_agent_profile(
         self,
         scenario: SimulationScenario,
@@ -820,97 +1092,83 @@ class SimulationEngine:
         **kwargs
     ) -> AgentProfile:
         """Add an agent profile to a scenario."""
+        # NEW v2.0: allow movement_model and journey in kwargs
+        movement_model = kwargs.pop("movement_model", scenario.default_movement_model)
+        journey = kwargs.pop("journey", None)
+
         profile = AgentProfile(
             id=str(uuid.uuid4()),
             name=name,
             agent_type=agent_type,
             role=role,
+            movement_model=movement_model,
+            journey=journey,
             **kwargs
         )
         scenario.agent_profiles.append(profile)
         scenario.agent_counts[profile.id] = count
         return profile
-        
+
     def add_event(self, scenario: SimulationScenario, time: float, event_type: str, **kwargs):
-        """Add an event to a scenario."""
         event = {
             "time": time,
             "type": event_type,
             **kwargs
         }
         scenario.events.append(event)
-        
+
     def initialize_simulation(
         self,
         bim_model: BIMModel,
         spatial_engine: SpatialIntelligenceEngine,
         scenario: SimulationScenario
     ) -> BIMSimulationModel:
-        """Initialize a simulation run."""
         logger.info(f"Initializing simulation: {scenario.name}")
-        
         self.current_model = BIMSimulationModel(
             bim_model=bim_model,
             spatial_engine=spatial_engine,
             scenario=scenario
         )
-        
         self.current_step = 0
         self.is_running = False
-        
         return self.current_model
-        
+
     def step(self):
-        """Execute one simulation step."""
         if not self.current_model or not self.is_running:
             return
-            
         self.current_model.step()
         self.current_step += 1
-        
-        # Notify callbacks
         for callback in self.on_step_callbacks:
             callback(self.current_step, self.current_model)
-            
-        # Check if simulation is complete
         if self.current_step >= self.current_model.max_steps:
             self.stop()
-            
+
     def run(self, steps: Optional[int] = None):
-        """Run the simulation for specified steps."""
         if not self.current_model:
             logger.error("No simulation model initialized")
             return
-            
         self.is_running = True
         target_steps = steps or self.current_model.max_steps
-        
         while self.is_running and self.current_step < target_steps:
             self.step()
-            
-        # Notify completion callbacks
         if not self.is_running:
             for callback in self.on_complete_callbacks:
                 callback(self.current_model)
-                
+
     def start(self):
-        """Start or resume the simulation."""
         self.is_running = True
         logger.info("Simulation started")
-        
+
     def pause(self):
-        """Pause the simulation."""
         self.is_running = False
         logger.info("Simulation paused")
-        
+
     def stop(self):
-        """Stop the simulation."""
         self.is_running = False
         self.current_step = 0
         logger.info("Simulation stopped")
-        
+
     def reset(self):
-        """Reset the simulation to initial state."""
         self.is_running = False
         self.current_step = 0
         if self.current_model:
@@ -923,14 +1181,77 @@ class SimulationEngine:
                 scenario=scenario
             )
         logger.info("Simulation reset")
-        
+
+    # NEW v2.0: Batch simulation
+    def run_batch(
+        self,
+        bim_model: BIMModel,
+        spatial_engine: SpatialIntelligenceEngine,
+        scenario: SimulationScenario,
+        runs: int = 10,
+        seeds: Optional[List[int]] = None
+    ) -> List[Dict]:
+        """
+        Run the same scenario multiple times with different seeds for statistical robustness.
+        Returns a list of result dicts.
+        """
+        if seeds is None:
+            seeds = list(range(42, 42 + runs))
+        if len(seeds) < runs:
+            seeds = seeds + list(range(seeds[-1] + 1, seeds[-1] + 1 + runs - len(seeds))) if seeds else list(range(42, 42 + runs))
+
+        self.batch_results = []
+        for i, seed in enumerate(seeds[:runs]):
+            logger.info(f"Batch run {i+1}/{runs} with seed {seed}")
+            random.seed(seed)
+            np.random.seed(seed)
+            model = self.initialize_simulation(bim_model, spatial_engine, scenario)
+            self.run()
+            results = self.get_results()
+            results["seed"] = seed
+            results["run_index"] = i + 1
+            self.batch_results.append(results)
+            self.reset()
+
+        logger.info(f"Batch simulation complete: {len(self.batch_results)} runs")
+        return self.batch_results
+
+    def get_batch_summary(self) -> Dict:
+        """Compute statistics across batch runs."""
+        if not self.batch_results:
+            return {}
+
+        evacuation_times = []
+        avg_speeds = []
+        total_interactions = []
+        congestion_counts = []
+
+        for r in self.batch_results:
+            final = r.get("final_metrics", {})
+            avg_speeds.append(final.get("avg_speed", 0))
+            total_interactions.append(r.get("total_interactions", 0))
+            congestion_counts.append(len(r.get("congestion_events", [])))
+            # Approximate evacuation time from last evacuated agent
+            hist = r.get("metrics_history", [])
+            if hist:
+                evacuation_times.append(len(hist) * r["scenario"].get("duration", 0) / max(len(hist), 1))
+
+        import statistics
+        summary = {
+            "runs": len(self.batch_results),
+            "avg_speed_mean": statistics.mean(avg_speeds) if avg_speeds else 0,
+            "avg_speed_std": statistics.stdev(avg_speeds) if len(avg_speeds) > 1 else 0,
+            "total_interactions_mean": statistics.mean(total_interactions) if total_interactions else 0,
+            "congestion_events_mean": statistics.mean(congestion_counts) if congestion_counts else 0,
+            "evacuation_time_mean": statistics.mean(evacuation_times) if evacuation_times else 0,
+            "evacuation_time_std": statistics.stdev(evacuation_times) if len(evacuation_times) > 1 else 0,
+        }
+        return summary
+
     def get_results(self) -> Dict:
-        """Get comprehensive simulation results."""
         if not self.current_model:
             return {}
-            
         model = self.current_model
-        
         return {
             "scenario": {
                 "name": model.scenario.name,
@@ -944,33 +1265,37 @@ class SimulationEngine:
             "congestion_events": model.congestion_events,
             "total_interactions": model.social_interactions,
             "evacuated_agents": model.evacuated_agents,
-            "completed_events": model.completed_events
+            "completed_events": model.completed_events,
+            "movement_models_used": list(set(a.profile.movement_model for a in model._get_all_agents())),
         }
-        
+
     def on_step(self, callback: Callable):
-        """Register a callback for simulation steps."""
         self.on_step_callbacks.append(callback)
-        
+
     def on_complete(self, callback: Callable):
-        """Register a callback for simulation completion."""
         self.on_complete_callbacks.append(callback)
 
+    def list_available_models(self) -> List[str]:
+        """Return available pedestrian dynamics model names."""
+        return list_models()
 
-# Preset scenarios
+
+# ---------------------------------------------------------------------------
+# Preset scenarios (updated for v2.0)
+# ---------------------------------------------------------------------------
+
 class ScenarioPresets:
     """Predefined simulation scenarios."""
-    
+
     @staticmethod
     def office_scenario() -> SimulationScenario:
-        """Create a typical office scenario."""
         engine = SimulationEngine()
         scenario = engine.create_scenario(
             name="Office Daily Operations",
             description="Simulate a typical day in an office building",
-            duration=28800  # 8 hours in seconds
+            duration=28800,
+            default_movement_model="collision_free_speed"
         )
-        
-        # Add office workers
         profile = engine.add_agent_profile(
             scenario=scenario,
             name="Office Worker",
@@ -979,38 +1304,22 @@ class ScenarioPresets:
             count=50,
             base_speed=1.2,
             sociability=0.4,
-            schedule={
-                0: "move",  # Arrival
-                14400: "move",  # Lunch
-                18000: "move",  # Return
-                25200: "move"  # Departure
-            }
+            schedule={0: "move", 14400: "move", 18000: "move", 25200: "move"}
         )
-        
-        # Add morning arrival event
-        engine.add_event(scenario, time=0, event_type="spawn_agents", 
-                        profile_id=profile.id, count=50)
-        
-        # Add lunch event
-        engine.add_event(scenario, time=14400, event_type="set_destination",
-                        filter={"profile.agent_type": AgentType.HUMAN})
-        
-        # Add evacuation drill event
+        engine.add_event(scenario, time=0, event_type="spawn_agents", profile_id=profile.id, count=50)
+        engine.add_event(scenario, time=14400, event_type="set_destination", filter={"profile.agent_type": AgentType.HUMAN})
         engine.add_event(scenario, time=20000, event_type="evacuate")
-        
         return scenario
-    
+
     @staticmethod
     def evacuation_scenario() -> SimulationScenario:
-        """Create an evacuation scenario."""
         engine = SimulationEngine()
         scenario = engine.create_scenario(
             name="Emergency Evacuation",
             description="Simulate emergency evacuation of the building",
-            duration=1800  # 30 minutes
+            duration=1800,
+            default_movement_model="social_force"
         )
-        
-        # Mix of occupants
         occupants = engine.add_agent_profile(
             scenario=scenario,
             name="Occupant",
@@ -1021,27 +1330,19 @@ class ScenarioPresets:
             risk_tolerance=0.3,
             schedule={0: "evacuate"}
         )
-        
-        # Immediate evacuation
         engine.add_event(scenario, time=0, event_type="evacuate")
-        
-        # Fire event after 2 minutes
-        engine.add_event(scenario, time=120, event_type="fire",
-                        location=[0, 0, 0], spread_rate=0.5)
-        
+        engine.add_event(scenario, time=120, event_type="fire", location=[0, 0, 0], spread_rate=0.5)
         return scenario
-    
+
     @staticmethod
     def hospital_scenario() -> SimulationScenario:
-        """Create a hospital scenario."""
         engine = SimulationEngine()
         scenario = engine.create_scenario(
             name="Hospital Operations",
             description="Simulate hospital patient and staff movement",
-            duration=86400  # 24 hours
+            duration=86400,
+            default_movement_model="anticipation_velocity"
         )
-        
-        # Staff
         staff = engine.add_agent_profile(
             scenario=scenario,
             name="Medical Staff",
@@ -1051,8 +1352,6 @@ class ScenarioPresets:
             base_speed=1.5,
             sociability=0.6
         )
-        
-        # Patients
         patients = engine.add_agent_profile(
             scenario=scenario,
             name="Patient",
@@ -1063,8 +1362,6 @@ class ScenarioPresets:
             needs_accessible=True,
             can_use_stairs=False
         )
-        
-        # Service robots
         robots = engine.add_agent_profile(
             scenario=scenario,
             name="Service Robot",
@@ -1073,20 +1370,17 @@ class ScenarioPresets:
             base_speed=1.0,
             size=0.3
         )
-        
         return scenario
-    
+
     @staticmethod
     def university_scenario() -> SimulationScenario:
-        """Create a university campus scenario."""
         engine = SimulationEngine()
         scenario = engine.create_scenario(
             name="University Class Transitions",
             description="Simulate student movement between classes",
-            duration=10800  # 3 hours (multiple class periods)
+            duration=10800,
+            default_movement_model="collision_free_speed"
         )
-        
-        # Students
         students = engine.add_agent_profile(
             scenario=scenario,
             name="Student",
@@ -1095,12 +1389,39 @@ class ScenarioPresets:
             count=200,
             base_speed=1.3,
             sociability=0.7,
-            schedule={
-                0: "move",      # First class transition
-                2700: "move",   # Second transition
-                5400: "move",   # Third transition
-                8100: "move"    # End of day
-            }
+            schedule={0: "move", 2700: "move", 5400: "move", 8100: "move"}
         )
-        
+        return scenario
+
+    @staticmethod
+    def queueing_scenario() -> SimulationScenario:
+        """NEW v2.0: Scenario demonstrating flow limits and queueing."""
+        engine = SimulationEngine()
+        scenario = engine.create_scenario(
+            name="Queue Formation at Narrow Door",
+            description="Demonstrate queueing behavior with flow-limited door",
+            duration=600,
+            default_movement_model="social_force"
+        )
+        # Create a journey: wait in lobby -> flow through door -> exit
+        from engine.journey_system import Journey, WaypointStage, FlowLimitStage, WaitStage
+        journey = Journey(
+            id=str(uuid.uuid4()),
+            name="Lobby to Exit",
+            stages=[
+                WaitStage("lobby", 5.0, "Wait in lobby"),
+                FlowLimitStage("exit", max_flow_rate=1.5, name="Pass through door"),
+                WaypointStage("outside", "Exit building"),
+            ]
+        )
+        engine.add_agent_profile(
+            scenario=scenario,
+            name="Visitor",
+            agent_type=AgentType.HUMAN,
+            role=HumanRole.VISITOR,
+            count=30,
+            base_speed=1.2,
+            journey=journey,
+            patience=0.8
+        )
         return scenario

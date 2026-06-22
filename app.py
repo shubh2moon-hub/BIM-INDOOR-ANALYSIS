@@ -154,7 +154,7 @@ def main():
     # Create application
     app = QApplication(sys.argv)
     app.setApplicationName("BIM-Agent Studio")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.2.0")
     app.setOrganizationName("BIM-Agent Studio")
     
     # Set application font

@@ -12,7 +12,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="bim-agent-studio",
-    version="1.0.0",
+    version="1.2.0",
     author="BIM-Agent Studio Team",
     description="BIM-native Agent-Based Modeling and Simulation Platform",
     long_description=long_description,
