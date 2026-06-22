@@ -400,15 +400,38 @@ class Visualization3D(QObject):
                 name=f"graph_node_{node_id}"
             )
             
-    def load_simulation(self, simulation: BIMSimulationModel):
+    # ------------------------------------------------------------------
+    # Mesa-version-safe agent iterator
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_agents(simulation: 'BIMSimulationModel') -> list:
+        """Return a list of agents compatible with Mesa 2.x and 3.x."""
+        sched = simulation.schedule
+        # Mesa 2.x: SimultaneousActivation stores agents in ._agents dict
+        if hasattr(sched, '_agents'):
+            return list(sched._agents.values())
+        # Mesa 2.x fallback via .agents property
+        if hasattr(sched, 'agents'):
+            try:
+                return list(sched.agents)
+            except Exception:
+                pass
+        # Last resort: read from model's own dict
+        return list(simulation.agents.values())
+
+    def load_simulation(self, simulation: 'BIMSimulationModel'):
         """Load a simulation for visualization."""
         self.current_simulation = simulation
-        
-        # If BIM model not loaded, load it
+
+        # If BIM model not yet loaded, load it first
         if not self.current_model and simulation.bim_model:
             self.load_bim_model(simulation.bim_model)
-            
-        logger.info("Simulation loaded into 3D view")
+
+        # Draw agents immediately so they appear before the user presses Start
+        if self.plotter:
+            self._update_agents()
+
+        logger.info(f"Simulation loaded into 3D view ({len(self._get_agents(simulation))} agents)")
         
     def start_simulation_visualization(self):
         """Start real-time simulation visualization updates."""
@@ -438,57 +461,78 @@ class Visualization3D(QObject):
         """Update agent representations in 3D view."""
         if not self.current_simulation or not self.plotter:
             return
-            
-        agents = list(self.current_simulation.schedule.agents)
-        
-        # Remove agents that no longer exist
-        dead_agents = set(self.agent_actors.keys()) - {a.unique_id for a in agents}
-        for agent_id in dead_agents:
-            if agent_id in self.agent_actors:
-                try:
-                    self.plotter.remove_actor(self.agent_actors[agent_id])
-                except Exception:
-                    pass
-                del self.agent_actors[agent_id]
-                
-        # Update or create agent actors
+
+        agents = self._get_agents(self.current_simulation)
+
+        # Remove actors for agents that no longer exist
+        live_ids = {a.unique_id for a in agents}
+        dead_ids = set(self.agent_actors.keys()) - live_ids
+        for agent_id in dead_ids:
+            try:
+                self.plotter.remove_actor(self.agent_actors[agent_id])
+            except Exception:
+                pass
+            del self.agent_actors[agent_id]
+
+        # Update or create actor for each live agent
         for agent in agents:
+            # Remove stale actor (position may have changed)
             if agent.unique_id in self.agent_actors:
-                # Update existing agent position
-                actor = self.agent_actors[agent.unique_id]
-                # Remove and recreate (PyVista doesn't support direct position update easily)
                 try:
-                    self.plotter.remove_actor(actor)
+                    self.plotter.remove_actor(self.agent_actors[agent.unique_id])
                 except Exception:
                     pass
-                    
-            # Create new actor for agent
+
             position = agent.position
             color = self.settings.agent_state_colors.get(
-                agent.state.value,
-                (0.5, 0.5, 0.5)
+                agent.state.value, (0.5, 0.5, 0.5)
             )
-            
+
+            # Scale by agent type
             size = self.settings.agent_size
             if agent.profile.agent_type.value == "vehicle":
-                size *= 2
+                size *= 2.0
             elif agent.profile.agent_type.value == "autonomous":
                 size *= 0.6
-                
-            sphere = pv.Sphere(
+
+            # Use a taller, more visible cylinder-on-sphere body
+            body_height = size * 3.0
+            body = pv.Cylinder(
+                center=(
+                    position[0],
+                    position[1],
+                    position[2] + size + body_height / 2.0,
+                ),
+                direction=(0, 0, 1),
                 radius=size,
-                center=(position[0], position[1], position[2] + size),
-                theta_resolution=12,
-                phi_resolution=12
+                height=body_height,
+                resolution=12,
             )
-            
+            head = pv.Sphere(
+                radius=size * 0.8,
+                center=(
+                    position[0],
+                    position[1],
+                    position[2] + size + body_height + size * 0.8,
+                ),
+                theta_resolution=10,
+                phi_resolution=10,
+            )
+            mesh = body.merge(head)
+
             actor = self.plotter.add_mesh(
-                sphere,
+                mesh,
                 color=color,
-                opacity=0.9,
-                name=f"agent_{agent.unique_id}"
+                opacity=0.95,
+                name=f"agent_{agent.unique_id}",
             )
             self.agent_actors[agent.unique_id] = actor
+
+        # Render immediately so agents appear without waiting for the timer
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
             
     def _update_density_map(self):
         """Update density heat map visualization."""
