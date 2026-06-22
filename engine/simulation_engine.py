@@ -83,6 +83,9 @@ from engine.journey_system import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Numerical epsilon to avoid divide-by-zero in direction calculations
+EPS = 1e-6
+
 
 # ---------------------------------------------------------------------------
 # Enums (kept for backward compatibility)
