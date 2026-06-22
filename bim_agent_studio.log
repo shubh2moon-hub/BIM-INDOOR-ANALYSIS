@@ -1,0 +1,9 @@
+2026-06-21 18:54:58,469 - __main__ - INFO - ============================================================
+2026-06-21 18:54:58,469 - __main__ - INFO - BIM-Agent Studio Starting
+2026-06-21 18:54:58,469 - __main__ - INFO - ============================================================
+2026-06-21 18:54:59,513 - __main__ - INFO - All dependencies verified
+2026-06-21 18:55:00,157 - matplotlib.font_manager - INFO - generated new fontManager
+2026-06-21 18:55:00,424 - __main__ - INFO - Creating main window...
+2026-06-21 18:55:00,425 - core.bim_processor - WARNING - Python OpenCASCADE not installed. Falling back to default geometry engine.
+2026-06-21 18:55:00,511 - gui.main_window - INFO - Main window initialized
+2026-06-21 18:55:00,858 - __main__ - INFO - Application started successfully
