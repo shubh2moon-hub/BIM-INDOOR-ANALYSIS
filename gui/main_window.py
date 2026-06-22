@@ -718,21 +718,18 @@ class MainWindow(QMainWindow):
             
         # Create visualization plotter
         try:
-            self.visualization.create_plotter(parent=self.viz_container, show=True)
-            
-            # Get the Qt widget from the plotter
-            if self.visualization.plotter:
-                # The plotter should have a QtInteractor widget
-                qt_widget = self.visualization.plotter.interactor
-                if qt_widget:
-                    layout = self.viz_container.layout()
-                    layout.addWidget(qt_widget)
-                    
+            # create_plotter returns a QtInteractor which is itself a QWidget
+            qt_widget = self.visualization.create_plotter(parent=self.viz_container, show=True)
+
+            # Add the interactor widget to the container layout
+            layout = self.viz_container.layout()
+            layout.addWidget(qt_widget)
+
             # Load the model
             self.visualization.load_bim_model(model)
-            
+
             self.log_message("3D visualization initialized")
-            
+
         except Exception as e:
             self.log_message(f"Error initializing 3D view: {e}", "ERROR")
             # Fallback to placeholder

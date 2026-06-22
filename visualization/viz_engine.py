@@ -11,7 +11,7 @@ from enum import Enum
 
 import numpy as np
 import pyvista as pv
-from pyvistaqt import BackgroundPlotter
+from pyvistaqt import QtInteractor
 from PySide6.QtCore import QObject, Signal, QTimer
 
 from core.bim_processor import BIMModel, BIMSpace, BIMElement, ElementCategory
@@ -95,7 +95,7 @@ class Visualization3D(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings = VisualizationSettings()
-        self.plotter: Optional[BackgroundPlotter] = None
+        self.plotter: Optional[QtInteractor] = None
         self.current_model: Optional[BIMModel] = None
         self.current_simulation: Optional[BIMSimulationModel] = None
         self.spatial_graph: Optional[SpatialGraph] = None
@@ -114,31 +114,34 @@ class Visualization3D(QObject):
         # Callbacks
         self.on_selection_callbacks: List[Callable] = []
         
-    def create_plotter(self, parent=None, show=True) -> BackgroundPlotter:
-        """Create and configure the PyVista plotter."""
-        self.plotter = BackgroundPlotter(
-            parent=parent,
-            title="BIM-Agent Studio 3D Viewer",
-            window_size=(1024, 768),
-            off_screen=not show
-        )
-        
+    def create_plotter(self, parent=None, show=True) -> QtInteractor:
+        """Create and configure the PyVista plotter.
+
+        Uses QtInteractor (embedded widget) instead of BackgroundPlotter
+        (separate window) so it can be placed inside the main window layout
+        without triggering the 'multiple values for parent' error.
+        """
+        self.plotter = QtInteractor(parent)
+
         # Configure plotter
         self.plotter.set_background(self.settings.background_color)
         self.plotter.add_axes()
         self.plotter.add_bounding_box()
-        
+
         # Enable picking
-        self.plotter.enable_element_picking(
-            callback=self._on_element_picked,
-            show=False
-        )
-        
+        try:
+            self.plotter.enable_element_picking(
+                callback=self._on_element_picked,
+                show=False
+            )
+        except Exception as e:
+            logger.warning(f"Element picking not available: {e}")
+
         # Setup update timer
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_simulation_visualization)
-        
-        logger.info("3D plotter created")
+
+        logger.info("3D plotter created (QtInteractor)")
         return self.plotter
         
     def load_bim_model(self, model: BIMModel):
