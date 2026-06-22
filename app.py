@@ -16,15 +16,27 @@ if str(project_dir) not in sys.path:
     sys.path.insert(0, str(project_dir))
 
 def setup_logging(verbose: bool = False):
-    """Configure application logging."""
+    """Configure application logging.
+
+    Writes the log file to %APPDATA%\\BIM-Agent Studio\\logs\\ so that the
+    application works correctly when installed under Program Files (which is
+    read-only for normal users).
+    """
     level = logging.DEBUG if verbose else logging.INFO
-    
+
+    # Use a user-writable directory for the log file so the app works
+    # correctly when installed system-wide under Program Files.
+    appdata = os.environ.get("APPDATA") or str(Path.home())
+    log_dir = Path(appdata) / "BIM-Agent Studio" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "bim_agent_studio.log"
+
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('bim_agent_studio.log', mode='w')
+            logging.FileHandler(str(log_file), mode='w')
         ]
     )
 

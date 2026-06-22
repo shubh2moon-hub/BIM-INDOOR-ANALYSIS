@@ -69,15 +69,15 @@ def run_pyinstaller():
     )
 
     if result.returncode != 0:
-        print("\n✗ PyInstaller build failed.")
+        print("\n[FAIL] PyInstaller build failed.")
         sys.exit(1)
 
     exe_path = DIST_DIR / APP_NAME / f"{APP_NAME}.exe"
     if not exe_path.is_file():
-        print(f"\n✗ Expected executable not found: {exe_path}")
+        print(f"\n[FAIL] Expected executable not found: {exe_path}")
         sys.exit(1)
 
-    print(f"\n✓ PyInstaller build succeeded: {exe_path}")
+    print(f"\n[OK] PyInstaller build succeeded: {exe_path}")
     return exe_path
 
 
@@ -91,7 +91,7 @@ def compile_installer():
     iscc = find_iscc()
     if iscc is None:
         print(
-            "\n✗ Inno Setup compiler (ISCC.exe) not found.\n"
+            "\n[FAIL] Inno Setup compiler (ISCC.exe) not found.\n"
             "  Install Inno Setup from https://jrsoftware.org/isinfo.php\n"
             "  or run:  winget install -e --id JRSoftware.InnoSetup"
         )
@@ -100,7 +100,7 @@ def compile_installer():
     print(f"  ISCC.exe found at: {iscc}")
 
     if not ISS_FILE.is_file():
-        print(f"\n✗ Installer script not found: {ISS_FILE}")
+        print(f"\n[FAIL] Installer script not found: {ISS_FILE}")
         sys.exit(1)
 
     result = subprocess.run(
@@ -109,18 +109,18 @@ def compile_installer():
     )
 
     if result.returncode != 0:
-        print("\n✗ Inno Setup compilation failed.")
+        print("\n[FAIL] Inno Setup compilation failed.")
         sys.exit(1)
 
     # Find the output
     setup_files = list(DIST_DIR.glob("BIM-Agent-Studio-Setup-*.exe"))
     if setup_files:
         setup_exe = setup_files[0]
-        print(f"\n✓ Installer created: {setup_exe}")
+        print(f"\n[OK] Installer created: {setup_exe}")
         print(f"  Size: {setup_exe.stat().st_size / (1024*1024):.1f} MB")
         return setup_exe
     else:
-        print("\n✗ Setup exe not found in dist/")
+        print("\n[FAIL] Setup exe not found in dist/")
         sys.exit(1)
 
 
