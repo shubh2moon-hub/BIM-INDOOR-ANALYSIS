@@ -302,6 +302,108 @@ class BenchmarkScenarios:
         return scenario
 
     @staticmethod
+    def rimea_5_t_junction():
+        """
+        RiMEA-Inspired Test 5: T-Junction Merging (NEW v1.3.0)
+
+        Two groups approaching from different corridors merge at a T-junction
+        and continue to a shared destination. Tests:
+        - Merging conflict resolution
+        - Lane formation after merge
+        - Group cohesion during merge (if group_id is set)
+
+        Expected: agents from both branches merge smoothly without deadlock;
+        merged stream shows reasonable throughput comparable to single-stream
+        density-speed relationship.
+        """
+        engine = SimulationEngine()
+        scenario = engine.create_scenario(
+            name="RiMEA-5: T-Junction Merging",
+            description="Two groups of 20 pedestrians merging at a T-junction",
+            duration=180,
+            time_step=0.1,
+            default_movement_model="anticipation_velocity"   # best for merging
+        )
+        # Branch A group (from the left)
+        engine.add_agent_profile(
+            scenario=scenario,
+            name="Branch A",
+            agent_type=AgentType.HUMAN,
+            role=HumanRole.VISITOR,
+            count=20,
+            base_speed=1.34,
+            size=0.25,
+            group_id="branch_a"
+        )
+        # Branch B group (from perpendicular corridor)
+        engine.add_agent_profile(
+            scenario=scenario,
+            name="Branch B",
+            agent_type=AgentType.HUMAN,
+            role=HumanRole.VISITOR,
+            count=20,
+            base_speed=1.34,
+            size=0.25,
+            group_id="branch_b"
+        )
+        # Both groups target same exit
+        engine.add_event(scenario, time=0, event_type="set_destination",
+                        destination="end")
+        return scenario
+
+    @staticmethod
+    def fed_evacuation_test():
+        """
+        FED Evacuation Scenario (NEW v1.3.0)
+
+        50 agents in a building with a fire breaking out at t=30s.
+        Tests FED (Fractional Effective Dose) accumulation:
+        - Agents in fire zones slow down due to smoke
+        - Agents accumulate FED; those reaching FED >= 1.0 are incapacitated
+        - Evacuation success rate = (evacuated) / (evacuated + incapacitated)
+
+        Based on simplified ISO 13571 CO+O2 deficit model.
+        Expected: most agents far from fire origin evacuate safely;
+        agents trapped in fire zone are incapacitated after ~50s at full hazard.
+        """
+        engine = SimulationEngine()
+        scenario = engine.create_scenario(
+            name="FED Evacuation Test",
+            description="50 agents evacuating with fire/smoke; FED tracking enabled",
+            duration=300,
+            time_step=0.1,
+            default_movement_model="social_force"  # best for evacuation crowds
+        )
+        engine.add_agent_profile(
+            scenario=scenario,
+            name="Occupant",
+            agent_type=AgentType.HUMAN,
+            role=HumanRole.VISITOR,
+            count=50,
+            base_speed=1.4,
+            size=0.25,
+            risk_tolerance=0.4
+        )
+        # Evacuation trigger at t=0
+        engine.add_event(scenario, time=0, event_type="evacuate")
+        # Fire breaks out at t=30s in the middle of the building
+        engine.add_event(
+            scenario, time=30,
+            event_type="fire",
+            location=[0.0, 0.0, 0.0],
+            spread_rate=0.8,
+            hazard_intensity=0.85,
+            smoke_level=0.75
+        )
+        # Block the corridor near the fire at t=30
+        engine.add_event(scenario, time=30, event_type="block_path",
+                        space_id="corridor")
+        # Unblock at t=120 (fire suppressed)
+        engine.add_event(scenario, time=120, event_type="unblock_path",
+                        space_id="corridor")
+        return scenario
+
+    @staticmethod
     def list_all() -> List[str]:
         """List all available benchmark scenarios."""
         return [
@@ -309,9 +411,11 @@ class BenchmarkScenarios:
             "RiMEA-2: Room Evacuation",
             "RiMEA-3: Bottleneck Flow",
             "RiMEA-4: Counterflow",
+            "RiMEA-5: T-Junction Merging",      # NEW v1.3.0
             "ISO-20414: Density-Speed Test",
             "High Density Stability",
             "Queue Formation",
+            "FED Evacuation Test",               # NEW v1.3.0
         ]
 
     @staticmethod
@@ -322,9 +426,11 @@ class BenchmarkScenarios:
             "RiMEA-2: Room Evacuation": BenchmarkScenarios.rimea_2_room_evacuation,
             "RiMEA-3: Bottleneck Flow": BenchmarkScenarios.rimea_3_bottleneck,
             "RiMEA-4: Counterflow": BenchmarkScenarios.rimea_4_counterflow,
+            "RiMEA-5: T-Junction Merging": BenchmarkScenarios.rimea_5_t_junction,    # NEW v1.3.0
             "ISO-20414: Density-Speed Test": BenchmarkScenarios.iso_20414_exit_speed_test,
             "High Density Stability": BenchmarkScenarios.high_density_stability_test,
             "Queue Formation": BenchmarkScenarios.queuing_behavior_test,
+            "FED Evacuation Test": BenchmarkScenarios.fed_evacuation_test,            # NEW v1.3.0
         }
         factory = mapping.get(name)
         return factory() if factory else None

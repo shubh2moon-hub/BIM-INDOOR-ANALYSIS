@@ -11,6 +11,16 @@ v2.0 Enhancements (inspired by JuPedSim):
 - Batch simulation support for statistical robustness
 - Benchmark scenarios (RiMEA-inspired)
 - Flow limitation and queueing support
+
+v1.3.0 Enhancements:
+- WarpDriver pedestrian model (gradient navigation field)
+- UniformGridSpatialIndex for O(1) average wall queries
+- Fractional Effective Dose (FED) tracking per agent (ISO 13571)
+- Smoke/visibility effects on agent speed and pathfinding
+- Runtime geometry switching: block_path now removes graph edges;
+  new unblock_path event restores them; affected agents are rerouted
+- Group behavior: cohesion force + leader-follower dynamics
+- New benchmark scenarios: RiMEA-5 (T-junction), FED evacuation
 """
 
 import uuid
@@ -62,11 +72,12 @@ except ImportError:
 from core.bim_processor import BIMModel, BIMSpace, BIMElement, ElementCategory
 from core.spatial_engine import SpatialGraph, SpatialIntelligenceEngine
 from engine.pedestrian_models import (
-    PedestrianModel, AgentMovementParams, WallSegment, get_model, list_models
+    PedestrianModel, AgentMovementParams, WallSegment,
+    UniformGridSpatialIndex, get_model, list_models
 )
 from engine.journey_system import (
     Journey, Stage, WaypointStage, WaitStage, FlowLimitStage, EvacuateStage,
-    DirectSteeringStage, StageResult, StageState
+    DirectSteeringStage, BlockedPathStage, StageResult, StageState
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +87,46 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Enums (kept for backward compatibility)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Group Behavior (NEW v1.3.0)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GroupBehavior:
+    """
+    Parameters controlling group cohesion and leader-follower dynamics.
+
+    Agents sharing the same `group_id` in their AgentProfile are linked at
+    simulation init. The first agent created in the group becomes the leader;
+    all others are followers. The leader navigates normally; followers are
+    attracted toward the leader's position (cohesion spring) while still
+    applying the standard pedestrian model for collision avoidance.
+    """
+    cohesion_strength: float = 0.8       # N — spring pull toward group centroid
+    separation_distance: float = 1.5    # m — preferred spacing within group
+    leader_id: Optional[int] = None     # unique_id of the group leader agent
+    follow_weight: float = 0.6          # blend between leader target and own target
+
+
+# ---------------------------------------------------------------------------
+# FED Constants (NEW v1.3.0) — simplified ISO 13571 CO + O₂ deficit model
+# ---------------------------------------------------------------------------
+
+# Time-to-incapacitation at different CO concentrations (ppm) and
+# O₂ deficit fractions, combined into a single hazard rate per time-step.
+# We use a simplified scalar "hazard_intensity" per fire zone (0–1).
+# FED increment per second = hazard_intensity * FED_RATE_COEFFICIENT
+# Agent is incapacitated when FED >= 1.0
+FED_RATE_COEFFICIENT: float = 0.02      # 1/s at hazard_intensity=1 → 50s to incap
+FED_SPEED_FACTOR: float = 0.3           # max speed reduction at FED=1 (30% of v0)
+
+# Smoke visibility constants (Jin 1978 / SFPE Handbook)
+# visibility = K / (smoke_OD_per_m)   — we use a dimensionless 0–1 smoke_level
+# speed_factor = (visibility / max_visibility)^0.5 clamped [0.3, 1.0]
+SMOKE_MAX_VISIBILITY: float = 10.0     # m — free-smoke visibility
+SMOKE_MIN_SPEED_RATIO: float = 0.3     # minimum speed ratio in dense smoke
+
 
 class AgentType(Enum):
     HUMAN = "human"
@@ -143,11 +194,14 @@ class AgentProfile:
     group_id: Optional[str] = None
 
     # NEW v2.0: Movement model selection
-    movement_model: str = "basic"  # basic, social_force, collision_free_speed, anticipation_velocity, generalized_centrifugal_force
+    movement_model: str = "basic"  # basic, social_force, collision_free_speed, anticipation_velocity, generalized_centrifugal_force, warp_driver
     movement_params: AgentMovementParams = field(default_factory=AgentMovementParams)
 
     # NEW v2.0: Journey for complex routing
     journey: Optional[Journey] = None
+
+    # NEW v1.3.0: Group behavior config
+    group_behavior: Optional[GroupBehavior] = None
 
     def __post_init__(self):
         # Sync legacy fields into movement_params
@@ -210,6 +264,10 @@ class SimulationMetrics:
     agents_queuing: int = 0
     avg_density: float = 0.0
     flow_rate: float = 0.0  # agents per second through exits
+    # NEW v1.3.0
+    agents_incapacitated: int = 0     # FED >= 1.0
+    max_fed: float = 0.0              # highest FED value among all agents
+    avg_smoke_exposure: float = 0.0   # average smoke_level experienced
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +297,9 @@ class BIMAgent(Agent):
         # Current speed (can vary)
         self.current_speed = profile.base_speed
 
-        # Group behavior
-        self.group_members = []
+        # Group behavior (NEW v1.3.0)
+        self.group_members: List['BIMAgent'] = []   # filled by model._link_groups()
+        self.is_group_leader: bool = False
 
         # NEW v2.0: Movement model instance
         self._movement_model: PedestrianModel = get_model(profile.movement_model)
@@ -254,6 +313,11 @@ class BIMAgent(Agent):
         # NEW v2.0: Waiting state
         self._wait_timer: float = 0.0
         self._flow_wait: bool = False
+
+        # NEW v1.3.0: FED / smoke tracking
+        self.fed: float = 0.0              # Fractional Effective Dose (0 = safe, >=1 = incapacitated)
+        self.is_incapacitated: bool = False
+        self.smoke_exposure: float = 0.0   # cumulative smoke exposure (0–1 per step)
 
     def step(self):
         """Execute one step of the agent."""
@@ -384,6 +448,18 @@ class BIMAgent(Agent):
         # NEW v2.0: Use pedestrian dynamics model for acceleration
         acceleration = self._compute_acceleration(desired_direction)
 
+        # NEW v1.3.0: Group cohesion — add spring force toward group leader/centroid
+        if self.group_members and not self.is_group_leader and self.profile.group_behavior:
+            gb = self.profile.group_behavior
+            if gb.leader_id is not None:
+                leader = self.model._agent_registry.get(gb.leader_id)
+                if leader and leader != self:
+                    cohesion_dir = leader.position - self.position
+                    cohesion_dist = np.linalg.norm(cohesion_dir)
+                    if cohesion_dist > gb.separation_distance:
+                        cohesion_force = gb.cohesion_strength * (cohesion_dir / (cohesion_dist + EPS))
+                        acceleration = acceleration + cohesion_force
+
         # Integrate velocity
         self.velocity += acceleration * self.model.time_step
 
@@ -398,6 +474,24 @@ class BIMAgent(Agent):
             # Approximate local density from nearby count
             local_density = nearby / (np.pi * 2.0 * 2.0)  # agents per m² in 2m radius
             max_speed *= max(0.1, math.exp(-0.5 * local_density))
+
+        # NEW v1.3.0: Smoke visibility — reduce speed based on local smoke level (Jin 1978)
+        if self.current_space:
+            fire_zone = self.model._fire_zones.get(self.current_space)
+            if fire_zone:
+                smoke_level = fire_zone.get("smoke_level", 0.0)
+                self.smoke_exposure = smoke_level
+                if smoke_level > 0:
+                    # visibility drops proportionally to smoke_level
+                    visibility = SMOKE_MAX_VISIBILITY * (1.0 - smoke_level)
+                    speed_ratio = max(SMOKE_MIN_SPEED_RATIO,
+                                      min(1.0, (visibility / SMOKE_MAX_VISIBILITY) ** 0.5))
+                    max_speed *= speed_ratio
+
+        # NEW v1.3.0: FED-based speed reduction (weakened agent due to CO exposure)
+        if self.fed > 0:
+            fed_factor = max(FED_SPEED_FACTOR, 1.0 - self.fed * (1.0 - FED_SPEED_FACTOR))
+            max_speed *= fed_factor
 
         if speed > max_speed:
             self.velocity = (self.velocity / speed) * max_speed
@@ -414,6 +508,18 @@ class BIMAgent(Agent):
         self.travel_time += self.model.time_step
 
         self._update_current_space()
+
+        # NEW v1.3.0: FED accumulation in fire zones
+        if self.current_space and not self.is_incapacitated:
+            fire_zone = self.model._fire_zones.get(self.current_space)
+            if fire_zone:
+                hazard = fire_zone.get("hazard_intensity", 0.0)
+                self.fed += hazard * FED_RATE_COEFFICIENT * self.model.time_step
+                if self.fed >= 1.0:
+                    self.is_incapacitated = True
+                    self.state = AgentState.DISABLED
+                    self.velocity = np.zeros(3)
+                    logger.debug(f"Agent {self.unique_id} incapacitated (FED={self.fed:.2f})")
 
     def _behavior_waiting(self):
         """Behavior when waiting."""
@@ -601,6 +707,12 @@ class BIMAgent(Agent):
             "interactions": self.interactions,
             "current_speed": self.current_speed,
             "movement_model": self.profile.movement_model,
+            # NEW v1.3.0
+            "fed": round(self.fed, 4),
+            "is_incapacitated": self.is_incapacitated,
+            "smoke_exposure": round(self.smoke_exposure, 4),
+            "group_id": self.profile.group_id,
+            "is_group_leader": self.is_group_leader,
         }
 
 
@@ -654,13 +766,19 @@ class BIMSimulationModel(Model):
         # Density map
         self.density_map: Dict[str, int] = {}
 
-        # NEW v2.0: Wall segment cache for fast lookup
+        # NEW v2.0: Wall segment cache + NEW v1.3.0: uniform grid spatial index
         self._wall_segments: List[WallSegment] = []
-        self._wall_spatial_index: Dict[str, List[WallSegment]] = {}
+        self._wall_grid_index: UniformGridSpatialIndex = UniformGridSpatialIndex(cell_size=5.0)
         self._build_wall_cache()
 
         # NEW v2.0: Flow limitation tracking (space_id -> next available time)
         self._flow_limits: Dict[str, float] = {}
+
+        # NEW v1.3.0: Fire zone tracking (space_id -> {hazard_intensity, smoke_level, visibility})
+        self._fire_zones: Dict[str, Dict[str, float]] = {}
+
+        # NEW v1.3.0: Blocked edges cache for unblock_path (edge_data per removed edge)
+        self._blocked_edges: Dict[str, List[Tuple]] = {}  # space_id -> [(u, v, data), ...]
 
         # Data collector
         self.datacollector = DataCollector(
@@ -671,6 +789,9 @@ class BIMSimulationModel(Model):
                 "Evacuated": lambda m: m.evacuated_agents,
                 "Queuing": self._count_queuing_agents,
                 "Avg Speed": self._get_avg_speed,
+                # NEW v1.3.0
+                "Incapacitated": lambda m: sum(1 for a in m._get_all_agents() if a.is_incapacitated),
+                "Max FED": lambda m: max((a.fed for a in m._get_all_agents()), default=0.0),
             },
             agent_reporters={
                 "State": lambda a: a.state.value,
@@ -678,11 +799,17 @@ class BIMSimulationModel(Model):
                 "Distance": lambda a: a.traveled_distance,
                 "Space": lambda a: a.current_space,
                 "Model": lambda a: a.profile.movement_model,
+                # NEW v1.3.0
+                "FED": lambda a: a.fed,
+                "GroupLeader": lambda a: a.is_group_leader,
             }
         )
 
         # Initialize agents
         self._initialize_agents()
+
+        # NEW v1.3.0: Link group members after all agents are created
+        self._link_groups()
 
         logger.info(f"Simulation model initialized: {len(self._get_all_agents())} agents, model={scenario.default_movement_model}")
 
@@ -710,17 +837,28 @@ class BIMSimulationModel(Model):
                     walls.append(WallSegment(p1, p2))
 
         self._wall_segments = walls
-        logger.info(f"Wall cache built: {len(walls)} segments")
+        # NEW v1.3.0: populate uniform grid spatial index for fast queries
+        self._wall_grid_index.build(walls)
+        logger.info(f"Wall cache built: {len(walls)} segments (spatial index ready)")
 
     def _get_wall_segments_near(self, position: np.ndarray, radius: float = 3.0) -> List[WallSegment]:
-        """Return wall segments within radius of position."""
-        # Simple O(N) check; for very large models a spatial index would help
-        nearby = []
-        for wall in self._wall_segments:
-            nearest = self._nearest_point_on_segment(position, wall)
-            if np.linalg.norm(position - nearest) < radius + 0.5:
-                nearby.append(wall)
-        return nearby
+        """Return wall segments within radius of position.
+
+        NEW v1.3.0: Uses UniformGridSpatialIndex for O(1) average cost instead
+        of the previous O(N) linear scan. Falls back to brute-force if the index
+        is empty (e.g. no BIM walls loaded).
+        """
+        if self._wall_segments:
+            # Candidate set from grid (conservative — may contain segments slightly beyond radius)
+            candidates = self._wall_grid_index.query(position, radius)
+            # Exact filter
+            nearby = []
+            for wall in candidates:
+                nearest = self._nearest_point_on_segment(position, wall)
+                if np.linalg.norm(position - nearest) < radius + 0.5:
+                    nearby.append(wall)
+            return nearby
+        return []
 
     @staticmethod
     def _nearest_point_on_segment(point: np.ndarray, wall: WallSegment) -> np.ndarray:
@@ -754,6 +892,39 @@ class BIMSimulationModel(Model):
             count = self.scenario.agent_counts.get(profile.id, 1)
             for _ in range(count):
                 self._create_agent(profile)
+
+    def _link_groups(self):
+        """
+        NEW v1.3.0: Link agents that share the same group_id.
+        The first agent created in the group becomes the leader.
+        All group members get references to each other and share a GroupBehavior.
+        """
+        # Gather agents by group_id
+        group_map: Dict[str, List['BIMAgent']] = {}
+        for agent in self._get_all_agents():
+            gid = agent.profile.group_id
+            if gid:
+                if gid not in group_map:
+                    group_map[gid] = []
+                group_map[gid].append(agent)
+
+        for gid, members in group_map.items():
+            if len(members) < 2:
+                continue
+            # First member is the leader
+            leader = members[0]
+            leader.is_group_leader = True
+
+            # Create a shared GroupBehavior if one is not specified on the profile
+            gb = members[0].profile.group_behavior or GroupBehavior(leader_id=leader.unique_id)
+            gb.leader_id = leader.unique_id
+
+            for member in members:
+                member.group_members = members
+                # Assign shared GroupBehavior to each member's profile
+                member.profile.group_behavior = gb
+
+            logger.info(f"Group '{gid}': {len(members)} agents linked, leader={leader.unique_id}")
 
     def _create_agent(self, profile: AgentProfile, position: Optional[Tuple] = None) -> BIMAgent:
         """Create a new agent in the simulation."""
@@ -846,6 +1017,8 @@ class BIMSimulationModel(Model):
             self._event_fire(event)
         elif event_type == "block_path":
             self._event_block_path(event)
+        elif event_type == "unblock_path":                # NEW v1.3.0
+            self._event_unblock_path(event)
         elif event_type == "set_destination":
             self._event_set_destination(event)
         elif event_type == "set_journey":
@@ -871,20 +1044,117 @@ class BIMSimulationModel(Model):
             agent._set_evacuation_destination()
 
     def _event_fire(self, event: Dict):
+        """
+        NEW v1.3.0: Enhanced fire event — now also populates _fire_zones with
+        hazard_intensity and smoke_level per affected space, enabling FED
+        accumulation and visibility-based speed reduction.
+        """
         location = event.get("location")
         spread_rate = event.get("spread_rate", 1.0)
+        hazard_intensity = event.get("hazard_intensity", 0.8)  # 0–1
+        smoke_level = event.get("smoke_level", 0.7)            # 0–1
+
         if location and self.spatial_engine and self.spatial_engine.spatial_graph:
             for node_id, node in self.spatial_engine.spatial_graph.nodes.items():
                 dist = np.linalg.norm(np.array(node.center) - np.array(location))
                 if dist < 10.0 * spread_rate:
                     node.attributes["on_fire"] = True
+                    # Map node -> space_id (strip "space_" prefix)
+                    space_id = node_id.replace("space_", "")
+                    # Hazard decays with distance from fire origin
+                    decay = max(0.1, 1.0 - dist / (10.0 * spread_rate + 1e-6))
+                    self._fire_zones[space_id] = {
+                        "hazard_intensity": hazard_intensity * decay,
+                        "smoke_level": smoke_level * decay,
+                        "visibility": SMOKE_MAX_VISIBILITY * (1.0 - smoke_level * decay),
+                    }
+
+        # Also penalize pathfinding through fire zones by increasing edge weight
+        if self.spatial_engine and self.spatial_engine.spatial_graph:
+            for space_id, zone in self._fire_zones.items():
+                node_id = f"space_{space_id}"
+                graph = self.spatial_engine.spatial_graph.network
+                if graph.has_node(node_id):
+                    # Increase weight of all edges to this node (smoke penalty)
+                    smoke_penalty = 100.0 * zone["smoke_level"]
+                    for u, v, data in list(graph.edges(node_id, data=True)):
+                        data["weight"] = data.get("weight", 1.0) + smoke_penalty
 
     def _event_block_path(self, event: Dict):
+        """
+        NEW v1.3.0: Actually removes graph edges to/from the blocked node so
+        pathfinding genuinely avoids the space. Edges are cached for later
+        restoration via unblock_path. Also forces affected agents to re-plan.
+        """
         space_id = event.get("space_id")
-        if space_id and self.spatial_engine and self.spatial_engine.spatial_graph:
-            node_id = f"space_{space_id}"
-            if node_id in self.spatial_engine.spatial_graph.nodes:
-                self.spatial_engine.spatial_graph.nodes[node_id].attributes["blocked"] = True
+        if not space_id or not self.spatial_engine or not self.spatial_engine.spatial_graph:
+            return
+        node_id = f"space_{space_id}"
+        graph = self.spatial_engine.spatial_graph.network
+        if node_id not in graph:
+            return
+
+        # Mark as blocked in node attributes
+        if node_id in self.spatial_engine.spatial_graph.nodes:
+            self.spatial_engine.spatial_graph.nodes[node_id].attributes["blocked"] = True
+
+        # Cache and remove all edges incident to this node
+        removed_edges = []
+        for u, v, data in list(graph.edges(node_id, data=True)):
+            removed_edges.append((u, v, data))
+        for u, v, _ in removed_edges:
+            graph.remove_edge(u, v)
+        self._blocked_edges[space_id] = removed_edges
+        logger.info(f"Path blocked: {space_id} ({len(removed_edges)} edges removed)")
+
+        # Force agents currently routing through this space to re-plan
+        self._reroute_agents_avoiding(space_id)
+
+    def _event_unblock_path(self, event: Dict):
+        """
+        NEW v1.3.0: Restore previously removed graph edges when a blocked space
+        is cleared (door opened, fire suppressed, etc.).
+        """
+        space_id = event.get("space_id")
+        if not space_id or not self.spatial_engine or not self.spatial_engine.spatial_graph:
+            return
+        node_id = f"space_{space_id}"
+
+        # Unmark
+        if node_id in self.spatial_engine.spatial_graph.nodes:
+            self.spatial_engine.spatial_graph.nodes[node_id].attributes["blocked"] = False
+
+        # Restore edges
+        graph = self.spatial_engine.spatial_graph.network
+        restored = 0
+        for u, v, data in self._blocked_edges.pop(space_id, []):
+            if not graph.has_edge(u, v):
+                graph.add_edge(u, v, **data)
+                restored += 1
+        logger.info(f"Path unblocked: {space_id} ({restored} edges restored)")
+
+        # Also remove from fire zones if present
+        self._fire_zones.pop(space_id, None)
+
+    def _reroute_agents_avoiding(self, blocked_space_id: str):
+        """
+        NEW v1.3.0: Clear the cached path for any agent that was planning to
+        pass through a now-blocked space. Agents will re-plan on the next step.
+        """
+        for agent in self._get_all_agents():
+            if agent.path:
+                # Check if any path waypoint belongs to this space
+                # Waypoints are space center tuples; we check if the closest
+                # space to any waypoint is the blocked one.
+                for waypoint in agent.path:
+                    if self.bim_model and self.bim_model.spaces:
+                        wp = np.array(waypoint)
+                        for sid, space in self.bim_model.spaces.items():
+                            if space.center:
+                                dist = np.linalg.norm(wp - np.array(space.center))
+                                if dist < 1.0 and sid == blocked_space_id:
+                                    agent.path = []  # Force re-plan
+                                    break
 
     def _event_set_destination(self, event: Dict):
         agent_filter = event.get("filter", {})
@@ -992,6 +1262,11 @@ class BIMSimulationModel(Model):
         # Compute flow rate (evacuated agents per second over last step)
         flow_rate = self.evacuated_agents / max(self.current_time, 1.0)
 
+        # NEW v1.3.0: FED metrics
+        incapacitated = sum(1 for a in agents if a.is_incapacitated)
+        max_fed = max((a.fed for a in agents), default=0.0)
+        avg_smoke = sum(a.smoke_exposure for a in agents) / total_agents if total_agents else 0.0
+
         metrics = SimulationMetrics(
             timestamp=getattr(self.schedule, 'steps', int(self.current_time)),
             agent_count=total_agents,
@@ -1009,6 +1284,10 @@ class BIMSimulationModel(Model):
             evacuation_progress=(self.evacuated_agents / total_agents * 100) if total_agents else 0,
             avg_density=avg_density,
             flow_rate=flow_rate,
+            # NEW v1.3.0
+            agents_incapacitated=incapacitated,
+            max_fed=round(max_fed, 4),
+            avg_smoke_exposure=round(avg_smoke, 4),
         )
         self.metrics_history.append(metrics)
         return metrics
@@ -1424,4 +1703,79 @@ class ScenarioPresets:
             journey=journey,
             patience=0.8
         )
+        return scenario
+
+    @staticmethod
+    def fire_evacuation_scenario() -> SimulationScenario:
+        """
+        NEW v1.3.0: Fire evacuation with FED tracking + smoke effects.
+
+        Demonstrates the full fire-safety simulation stack:
+        - Social Force Model for realistic crowd pushing during evacuation
+        - Fire breaks out at t=60s, generating smoke and hazard
+        - Agents in fire zones slow down (Jin 1978 visibility model)
+        - FED accumulates; incapacitated agents can no longer move
+        - Corridor is blocked at t=60s; agents must find alternate routes
+        - Corridor unblocked at t=180s (fire suppressed)
+        - Metrics: evacuation_progress, agents_incapacitated, max_fed
+        """
+        engine = SimulationEngine()
+        scenario = engine.create_scenario(
+            name="Fire Evacuation with FED Tracking",
+            description=(
+                "Realistic fire evacuation scenario with smoke, visibility effects, "
+                "FED tracking, and dynamic path blocking. Uses Social Force Model."
+            ),
+            duration=600,
+            time_step=0.1,
+            default_movement_model="social_force"
+        )
+
+        # Staff: trained, move faster, higher risk tolerance
+        engine.add_agent_profile(
+            scenario=scenario,
+            name="Staff",
+            agent_type=AgentType.HUMAN,
+            role=HumanRole.STAFF,
+            count=20,
+            base_speed=1.6,
+            max_speed=2.0,
+            risk_tolerance=0.7,
+            schedule={0: "evacuate"}
+        )
+
+        # Visitors: untrained, slower, more panicked
+        engine.add_agent_profile(
+            scenario=scenario,
+            name="Visitor",
+            agent_type=AgentType.HUMAN,
+            role=HumanRole.VISITOR,
+            count=80,
+            base_speed=1.2,
+            max_speed=1.8,
+            risk_tolerance=0.3,
+            schedule={0: "evacuate"}
+        )
+
+        # Start evacuation immediately
+        engine.add_event(scenario, time=0, event_type="evacuate")
+
+        # Fire breaks out at t=60s
+        engine.add_event(
+            scenario, time=60,
+            event_type="fire",
+            location=[5.0, 5.0, 0.0],
+            spread_rate=1.0,
+            hazard_intensity=0.9,
+            smoke_level=0.8
+        )
+
+        # Primary corridor blocked by fire at t=60s
+        engine.add_event(scenario, time=60, event_type="block_path",
+                        space_id="corridor")
+
+        # Fire suppressed at t=180s; corridor re-opens
+        engine.add_event(scenario, time=180, event_type="unblock_path",
+                        space_id="corridor")
+
         return scenario

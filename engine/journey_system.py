@@ -299,6 +299,97 @@ class RepeatStage(Stage):
 
 
 # ---------------------------------------------------------------------------
+# BlockedPathStage (NEW v1.3.0)
+# ---------------------------------------------------------------------------
+
+class BlockedPathStage(Stage):
+    """
+    Wait in place until a specified path/space is no longer blocked.
+
+    This stage complements the runtime geometry switching feature. When a path
+    is blocked (e.g. by fire or door closure), agents on a journey will pause
+    at their current location and wait for the block to be lifted before
+    proceeding to the next stage. Optionally, a fallback destination can be
+    provided so the agent navigates to an alternate route instead.
+
+    Usage:
+        BlockedPathStage(
+            blocked_space_id="corridor_3",
+            fallback_destination="stairwell_b",
+            timeout=120.0,      # give up and use fallback after 2 minutes
+            name="Wait for corridor clearance"
+        )
+    """
+
+    def __init__(
+        self,
+        blocked_space_id: str,
+        fallback_destination: Optional[str] = None,
+        timeout: float = float('inf'),
+        name: str = ""
+    ):
+        super().__init__(name=name or f"BlockedPath({blocked_space_id})")
+        self.blocked_space_id = blocked_space_id
+        self.fallback_destination = fallback_destination
+        self.timeout = timeout
+        self._elapsed: float = 0.0
+        self._using_fallback: bool = False
+
+    def update(self, agent, dt: float) -> StageResult:
+        if self.state == StageState.PENDING:
+            self.state = StageState.ACTIVE
+
+        if self.state == StageState.ACTIVE:
+            # Check if the path is still blocked via the spatial graph
+            model = agent.model
+            is_blocked = False
+            if (model.spatial_engine and
+                    model.spatial_engine.spatial_graph):
+                node_id = f"space_{self.blocked_space_id}"
+                node = model.spatial_engine.spatial_graph.nodes.get(node_id)
+                if node:
+                    is_blocked = node.attributes.get("blocked", False)
+
+            # Path has been unblocked — proceed
+            if not is_blocked and not self._using_fallback:
+                self.state = StageState.COMPLETED
+                return StageResult(state=StageState.COMPLETED, next_stage=True)
+
+            # Timeout reached — use fallback if available
+            self._elapsed += dt
+            if self._elapsed >= self.timeout:
+                if self.fallback_destination and not self._using_fallback:
+                    self._using_fallback = True
+                    return StageResult(
+                        state=StageState.ACTIVE,
+                        destination=self.fallback_destination,
+                        next_stage=False,
+                        metadata={"using_fallback": True}
+                    )
+                else:
+                    # No fallback; skip this stage
+                    self.state = StageState.SKIPPED
+                    return StageResult(state=StageState.SKIPPED, next_stage=True)
+
+            # Still waiting
+            return StageResult(
+                state=StageState.ACTIVE,
+                wait_duration=dt,
+                next_stage=False,
+                metadata={"blocked_space": self.blocked_space_id,
+                          "elapsed": self._elapsed}
+            )
+
+        return StageResult(state=self.state, next_stage=True)
+
+    def reset(self):
+        super().reset()
+        self._elapsed = 0.0
+        self._using_fallback = False
+
+
+
+# ---------------------------------------------------------------------------
 # Journey
 # ---------------------------------------------------------------------------
 

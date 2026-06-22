@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 """
-Pedestrian Dynamics Models
+Pedestrian Dynamics Models  (v1.3.0)
 
 Inspired by JuPedSim, implements multiple microscopic pedestrian movement models:
-- Social Force Model (SFM)          : Helbing et al. (2000)
-- Collision-Free Speed Model (CFSM)  : Tordeux et al. (2015)
-- Anticipation Velocity Model (AVM)    : Seitz & Köster (2012)
-- Generalized Centrifugal Force Model (GCFM): Chraibi et al. (2010)
+- Social Force Model (SFM)                    : Helbing et al. (2000)
+- Collision-Free Speed Model (CFSM)           : Tordeux et al. (2015)
+- Anticipation Velocity Model (AVM)           : Seitz & Köster (2012)
+- Generalized Centrifugal Force Model (GCFM)  : Chraibi et al. (2010)
+- WarpDriver Model (WD)                       : Gradient navigation field (JuPedSim 2024)
+
+NEW v1.3.0:
+- UniformGridSpatialIndex for O(1) average wall segment lookup
+- WarpDriverModel: probabilistic collision-field / gradient navigation model
 
 Each model returns a velocity change (acceleration) for a given agent based on
 its desired direction, nearby agents, and wall geometry.
@@ -54,7 +59,9 @@ class AgentMovementParams:
     # GCFM specific
     centrifugal_force_factor: float = 3.0
     # AVM specific
-    reaction_time: float = 0.4          # seconds
+    reaction_time: float = 0.4            # seconds
+    # WarpDriver specific
+    warp_sigma: float = 0.5              # Gaussian width of each agent's repulsion field
 
 
 @dataclass
@@ -70,6 +77,78 @@ class WallSegment:
         diff = self.p2 - self.p1
         self.length = np.linalg.norm(diff) + EPS
         self.unit = diff / self.length
+
+
+# ---------------------------------------------------------------------------
+# Spatial Index (NEW v1.3.0)
+# ---------------------------------------------------------------------------
+
+class UniformGridSpatialIndex:
+    """
+    Uniform grid spatial index for fast O(1)-average wall segment lookup.
+
+    The building footprint is partitioned into a grid of cells. Each wall
+    segment is inserted into all cells it overlaps. Queries return the union
+    of all segments in cells within the query radius — dramatically faster
+    than O(N) brute-force for large buildings.
+    """
+
+    def __init__(self, cell_size: float = 5.0):
+        self.cell_size = cell_size
+        # cell (ix, iy) -> list of WallSegment
+        self._cells: Dict[Tuple[int, int], List[WallSegment]] = {}
+
+    def _cell_key(self, x: float, y: float) -> Tuple[int, int]:
+        return (int(math.floor(x / self.cell_size)),
+                int(math.floor(y / self.cell_size)))
+
+    def insert(self, wall: WallSegment):
+        """Insert a wall segment into all overlapping grid cells."""
+        # Compute bounding box of the segment (2D: XY plane)
+        min_x = min(wall.p1[0], wall.p2[0])
+        max_x = max(wall.p1[0], wall.p2[0])
+        min_y = min(wall.p1[1], wall.p2[1])
+        max_y = max(wall.p1[1], wall.p2[1])
+
+        ix_min, iy_min = self._cell_key(min_x, min_y)
+        ix_max, iy_max = self._cell_key(max_x, max_y)
+
+        for ix in range(ix_min, ix_max + 1):
+            for iy in range(iy_min, iy_max + 1):
+                key = (ix, iy)
+                if key not in self._cells:
+                    self._cells[key] = []
+                self._cells[key].append(wall)
+
+    def query(self, position: np.ndarray, radius: float) -> List[WallSegment]:
+        """
+        Return all wall segments that could be within `radius` of `position`.
+        This is conservative (may include segments slightly beyond radius),
+        exact filtering is done by the caller.
+        """
+        x, y = float(position[0]), float(position[1])
+        ix_min, iy_min = self._cell_key(x - radius, y - radius)
+        ix_max, iy_max = self._cell_key(x + radius, y + radius)
+
+        seen = set()
+        result = []
+        for ix in range(ix_min, ix_max + 1):
+            for iy in range(iy_min, iy_max + 1):
+                key = (ix, iy)
+                for wall in self._cells.get(key, []):
+                    wid = id(wall)
+                    if wid not in seen:
+                        seen.add(wid)
+                        result.append(wall)
+        return result
+
+    def build(self, walls: List[WallSegment]):
+        """Bulk-insert a list of wall segments."""
+        self._cells.clear()
+        for wall in walls:
+            self.insert(wall)
+        logger.debug(f"SpatialIndex built: {len(walls)} walls into {len(self._cells)} cells "
+                     f"(cell_size={self.cell_size}m)")
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +499,135 @@ class BasicModel(PedestrianModel):
 
 
 # ---------------------------------------------------------------------------
+# 6. WarpDriver Model — Gradient Navigation Field (NEW v1.3.0)
+# ---------------------------------------------------------------------------
+
+class WarpDriverModel(PedestrianModel):
+    """
+    WarpDriver: Probabilistic Collision-Field / Gradient Navigation Field Model.
+
+    Inspired by the newest JuPedSim model (2024). Each agent creates a Gaussian
+    repulsion "charge cloud". The navigation field is the sum of all repulsive
+    fields plus a goal-attraction potential. The agent steers by descending the
+    gradient of the combined potential field.
+
+    This produces smoother, more natural large-crowd behavior without explicit
+    force calculations — particularly good for dense environments where SFM
+    tends to produce oscillatory behavior.
+
+    Algorithm:
+    1. Compute attraction potential gradient toward goal
+    2. Compute repulsion gradient from all neighbors (Gaussian fields)
+    3. Compute repulsion gradient from walls (exponential fields)
+    4. Combine gradients; derive target velocity
+    5. Clamp speed and apply relaxation
+    """
+
+    def __init__(self, attraction_strength: float = 3.0, num_samples: int = 8):
+        """
+        Parameters
+        ----------
+        attraction_strength : strength of the goal-attraction field
+        num_samples         : number of candidate directions sampled for gradient descent
+        """
+        self.attraction_strength = attraction_strength
+        self.num_samples = num_samples
+
+    def _gaussian_repulsion_gradient(
+        self,
+        agent_pos: np.ndarray,
+        source_pos: np.ndarray,
+        sigma: float,
+        amplitude: float
+    ) -> np.ndarray:
+        """
+        Gradient of a Gaussian repulsion field at agent_pos due to source at source_pos.
+        Field: U(r) = amplitude * exp(-|r|^2 / (2*sigma^2))
+        Gradient: dU/dx = U(r) * (-r / sigma^2)  [points away from source]
+        """
+        diff = agent_pos - source_pos
+        dist_sq = np.dot(diff, diff)
+        sigma_sq = sigma * sigma
+        field_val = amplitude * math.exp(-dist_sq / (2.0 * sigma_sq + EPS))
+        # Negative of gradient (ascent of repulsion = movement away from source)
+        gradient = field_val * (diff / (sigma_sq + EPS))
+        return gradient
+
+    def compute_velocity_change(
+        self,
+        agent_position: np.ndarray,
+        agent_velocity: np.ndarray,
+        params: AgentMovementParams,
+        desired_direction: np.ndarray,
+        neighbors: List[Tuple[np.ndarray, np.ndarray, AgentMovementParams]],
+        walls: List[WallSegment],
+        time_step: float
+    ) -> np.ndarray:
+        sigma = params.warp_sigma
+
+        # --- 1. Goal attraction: strong pull in desired direction ---
+        attraction = self.attraction_strength * params.desired_speed * desired_direction
+
+        # --- 2. Neighbor repulsion (Gaussian fields) ---
+        neighbor_repulsion = np.zeros(3)
+        for other_pos, other_vel, other_params in neighbors:
+            combined_sigma = sigma + other_params.warp_sigma
+            # Amplitude scales with combined agent sizes
+            amplitude = params.neighbor_repulsion_strength * 2.0
+            grad = self._gaussian_repulsion_gradient(
+                agent_position, other_pos, combined_sigma, amplitude
+            )
+            # Also anticipate future position (velocity-weighted)
+            future_pos = other_pos + other_vel * params.reaction_time
+            future_grad = self._gaussian_repulsion_gradient(
+                agent_position, future_pos, combined_sigma * 1.5, amplitude * 0.5
+            )
+            neighbor_repulsion += grad + future_grad
+
+        # --- 3. Wall repulsion (exponential decay, stronger than neighbor) ---
+        wall_repulsion = np.zeros(3)
+        for wall in walls:
+            nearest = self._nearest_point_on_segment(agent_position, wall)
+            diff = agent_position - nearest
+            dist = np.linalg.norm(diff) + EPS
+            # Exponential wall field: very strong up close
+            amplitude = params.geometry_repulsion_strength * 3.0
+            decay = params.geometry_repulsion_range
+            field_val = amplitude * math.exp(-dist / (decay + EPS))
+            wall_repulsion += field_val * (diff / dist)
+
+        # --- 4. Combine into navigation gradient ---
+        nav_gradient = attraction + neighbor_repulsion + wall_repulsion
+        nav_norm = np.linalg.norm(nav_gradient) + EPS
+        nav_direction = nav_gradient / nav_norm
+
+        # --- 5. Speed: modulated by nearest obstacle clearance ---
+        min_clearance = float('inf')
+        for other_pos, _, other_params in neighbors:
+            dist = np.linalg.norm(agent_position - other_pos) + EPS
+            clearance = dist - (params.radius + other_params.radius)
+            if clearance < min_clearance:
+                min_clearance = clearance
+
+        for wall in walls:
+            nearest = self._nearest_point_on_segment(agent_position, wall)
+            dist = np.linalg.norm(agent_position - nearest) + EPS
+            clearance = dist - params.radius
+            if clearance < min_clearance:
+                min_clearance = clearance
+
+        if min_clearance == float('inf') or min_clearance > 2.0:
+            speed = params.desired_speed
+        else:
+            # Smoothly reduce speed as clearance decreases
+            speed = params.desired_speed * max(0.0, math.tanh(min_clearance / params.radius))
+
+        target_velocity = nav_direction * speed
+        acceleration = (target_velocity - agent_velocity) / max(time_step, params.relaxation_time)
+        return acceleration
+
+
+# ---------------------------------------------------------------------------
 # Model Registry
 # ---------------------------------------------------------------------------
 
@@ -429,6 +637,7 @@ MODEL_REGISTRY: Dict[str, type] = {
     "collision_free_speed": CollisionFreeSpeedModel,
     "anticipation_velocity": AnticipationVelocityModel,
     "generalized_centrifugal_force": GeneralizedCentrifugalForceModel,
+    "warp_driver": WarpDriverModel,  # NEW v1.3.0
 }
 
 

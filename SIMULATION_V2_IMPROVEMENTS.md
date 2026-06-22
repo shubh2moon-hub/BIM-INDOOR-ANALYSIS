@@ -307,27 +307,42 @@ No new runtime dependencies were added. The improvements use only:
 
 Based on the JuPedSim roadmap, the following could be added next:
 
-1. **Fire Dynamics Simulator (FDS) coupling** — read smoke/visibility data to dynamically adjust agent speed and route choice.
-2. **Fractional Effective Dose (FED)** tracking per agent during fire evacuation.
-3. **WarpDriver Model** — probabilistic collision-field model (newest JuPedSim addition).
-4. **Spatial index for walls** (R-tree or uniform grid) for O(log N) wall queries in massive buildings.
-5. **Runtime geometry switching** — block/unblock paths dynamically during simulation.
-6. **AI-assisted scenario copilot** (MCP-based) — natural language scenario generation.
+1. **Fire Dynamics Simulator (FDS) coupling** — read actual FDS output files (smoke concentration, temperature) to drive FED accumulation and visibility calculation instead of the current scalar approximation.
+2. **AI-assisted scenario copilot** (MCP-based) — natural language scenario generation.
+3. **Spatial index for space-occupancy lookup** — `_update_current_space()` is O(M) per agent; a spatial hash of space bounding boxes would accelerate it.
+4. **Agent mobility impairments** — wheelchair users, elderly with reduced max speed; tie into `needs_accessible` flag and accessible pathfinding.
+5. **Multi-floor evacuation** — stairwell flow limits + elevator queuing integrated with the Journey system.
 
 ---
 
-## Summary
+## v1.3.0 Feature Summary
 
-| Feature | Before | After |
+| Feature | Status | Files |
 |---------|--------|-------|
-| Movement model | 1 simple model | 5 models (SFM, CFSM, AVM, GCFM, Basic) |
-| Collision avoidance | Simple repulsion vector | Physics-based forces + wall avoidance |
-| Routing | Single destination | Multi-stage Journeys (waypoints, wait, flow limits) |
-| Queueing | Not supported | Flow-limited stages with token-bucket queuing |
-| Wall interaction | None | Full geometry repulsion + soft constraint |
-| Batch runs | Not supported | Seeded multi-run with statistical summary |
-| Benchmarks | None | 7 RiMEA/ISO-inspired test cases |
-| Per-agent params | Fixed globals | Individual mass, radius, repulsion strength, reaction time |
-| Events | 5 types | 7 types (+ set_journey, switch_model) |
+| WarpDriver Model (gradient nav field) | ✅ Done | `pedestrian_models.py` |
+| UniformGridSpatialIndex (O(1) wall queries) | ✅ Done | `pedestrian_models.py`, `simulation_engine.py` |
+| FED tracking per agent (ISO 13571) | ✅ Done | `simulation_engine.py` |
+| Smoke/visibility speed effects (Jin 1978) | ✅ Done | `simulation_engine.py` |
+| Runtime geometry switching (block/unblock) | ✅ Done | `simulation_engine.py` |
+| Group behavior (cohesion + leader-follower) | ✅ Done | `simulation_engine.py` |
+| BlockedPathStage (journey-level path waiting) | ✅ Done | `journey_system.py` |
+| RiMEA-5 T-Junction benchmark | ✅ Done | `benchmark_scenarios.py` |
+| FED Evacuation benchmark | ✅ Done | `benchmark_scenarios.py` |
+| fire_evacuation_scenario preset | ✅ Done | `simulation_engine.py` |
 
-The simulation engine is now significantly more capable of producing **realistic, scientifically valid pedestrian dynamics** while remaining fully backward-compatible with existing BIM-Agent Studio scenarios.
+---
+
+## v2.0 → v1.3.0 Cumulative Summary
+
+| Feature | Before v2.0 | After v2.0 | After v1.3.0 |
+|---------|-------------|------------|--------------|
+| Movement models | 1 simple | 5 physics-based | **6 (+ WarpDriver)** |
+| Wall query cost | O(N) brute-force | O(N) brute-force | **O(1) avg (grid index)** |
+| Fire safety | Node flag only | Node flag only | **FED + smoke + speed effects** |
+| Path blocking | Attribute-only | Attribute-only | **Graph edge removal + rerouting** |
+| Group dynamics | group_id field unused | group_id field unused | **Cohesion force + leader-follower** |
+| Benchmark tests | 0 | 7 RiMEA/ISO | **9 (+ T-junction + FED evac)** |
+| Journey stages | — | 6 stages | **7 (+ BlockedPathStage)** |
+| Scenario presets | 4 | 5 | **6 (+ fire_evacuation)** |
+| Metrics | speed, density | + queuing, flow rate | **+ FED, incapacitated, smoke** |
+
