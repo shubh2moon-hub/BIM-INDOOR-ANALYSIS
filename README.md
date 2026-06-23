@@ -1,4 +1,4 @@
-# BIM-Agent Studio
+# BIM-INDOOR-ANALYSIS
 
 ## BIM-native Agent-Based Modeling and Simulation Platform
 
