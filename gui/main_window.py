@@ -58,6 +58,10 @@ class MainWindow(QMainWindow):
         self.is_simulation_running = False
         self.simulation_timer: Optional[QTimer] = None
         
+        # Room config state
+        self.custom_room_settings = {}
+        self.currently_selected_space_id = None
+        
         # UI Components storage
         self.panels: Dict[str, QDockWidget] = {}
         
@@ -67,6 +71,10 @@ class MainWindow(QMainWindow):
         self._create_status_bar()
         self._create_central_widget()
         self._create_dock_panels()
+        self._create_room_config_panel()
+        
+        # Connect signals
+        self.visualization.space_selected.connect(self._on_space_selected)
         
         # Setup simulation timer
         self.simulation_timer = QTimer(self)
@@ -173,6 +181,10 @@ class MainWindow(QMainWindow):
         uni_preset = QAction("&University Class Transitions", self)
         uni_preset.triggered.connect(lambda: self._load_preset("university"))
         presets_menu.addAction(uni_preset)
+        
+        fire_evac_preset = QAction("&Fire Evacuation", self)
+        fire_evac_preset.triggered.connect(lambda: self._load_preset("fire_evacuation"))
+        presets_menu.addAction(fire_evac_preset)
         
         sim_menu.addSeparator()
         
@@ -392,6 +404,108 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
         self.panels["Project"] = dock
         
+    def _create_room_config_panel(self):
+        """Create the room configurator panel."""
+        dock = QDockWidget("Room Configurator", self)
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        self.lbl_selected_room = QLabel("Selected Room: None")
+        self.lbl_selected_room.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.lbl_selected_room)
+        
+        self.lbl_room_occupancy = QLabel("IFC Occupancy: N/A")
+        layout.addWidget(self.lbl_room_occupancy)
+        
+        layout.addWidget(QLabel("Number of Agents:"))
+        self.spin_room_agents = QSpinBox()
+        self.spin_room_agents.setRange(0, 1000)
+        self.spin_room_agents.setEnabled(False)
+        layout.addWidget(self.spin_room_agents)
+        
+        self.chk_start_fire = QCheckBox("Set as Fire Origin")
+        self.chk_start_fire.setEnabled(False)
+        layout.addWidget(self.chk_start_fire)
+        
+        self.btn_apply_room = QPushButton("Apply to Room")
+        self.btn_apply_room.setEnabled(False)
+        self.btn_apply_room.clicked.connect(self._on_apply_room_config)
+        layout.addWidget(self.btn_apply_room)
+        
+        layout.addStretch()
+        
+        dock.setWidget(widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        self.panels["RoomConfigurator"] = dock
+
+    def _on_space_selected(self, space_id: str):
+        self.currently_selected_space_id = space_id
+        if self.current_model and space_id in self.current_model.spaces:
+            space = self.current_model.spaces[space_id]
+            self.lbl_selected_room.setText(f"Selected Room: {space.name}")
+            
+            occupancy = space.occupancy_capacity
+            if occupancy is not None:
+                self.lbl_room_occupancy.setText(f"IFC Occupancy: {occupancy}")
+            else:
+                self.lbl_room_occupancy.setText("IFC Occupancy: N/A")
+                
+            settings = self.custom_room_settings.get(space_id, {})
+            
+            self.spin_room_agents.setEnabled(True)
+            self.spin_room_agents.setValue(settings.get("agents", occupancy or 0))
+            
+            self.chk_start_fire.setEnabled(True)
+            self.chk_start_fire.setChecked(settings.get("fire", False))
+            
+            self.btn_apply_room.setEnabled(True)
+        else:
+            self.lbl_selected_room.setText("Selected Room: None")
+            self.lbl_room_occupancy.setText("IFC Occupancy: N/A")
+            self.spin_room_agents.setEnabled(False)
+            self.chk_start_fire.setEnabled(False)
+            self.btn_apply_room.setEnabled(False)
+
+    def _on_apply_room_config(self):
+        if self.currently_selected_space_id:
+            space_id = self.currently_selected_space_id
+            self.custom_room_settings[space_id] = {
+                "agents": self.spin_room_agents.value(),
+                "fire": self.chk_start_fire.isChecked()
+            }
+            self.log_message(f"Applied custom settings to space {space_id}")
+            
+            if self.current_simulation and not self.is_simulation_running:
+                self.log_message("Re-initializing scenario with new room config...")
+                scenario = self.current_simulation.scenario
+                
+                scenario.custom_room_agents.clear()
+                for s_id, conf in self.custom_room_settings.items():
+                    if conf["agents"] > 0:
+                        scenario.custom_room_agents[s_id] = conf["agents"]
+                
+                scenario.events = [e for e in scenario.events if e.get("event_type") != "fire"]
+                for s_id, conf in self.custom_room_settings.items():
+                    if conf["fire"]:
+                        space = self.current_model.spaces[s_id]
+                        if space.center:
+                            scenario.events.append({
+                                "time": 5,
+                                "event_type": "fire",
+                                "location": list(space.center),
+                                "spread_rate": 0.5,
+                                "hazard_intensity": 1.0,
+                                "smoke_level": 0.8
+                            })
+                
+                sim_model = self.simulation_engine.initialize_simulation(
+                    self.current_model, self.spatial_engine, scenario
+                )
+                self.current_simulation = sim_model
+                self.visualization.load_simulation(sim_model)
+
     def _create_properties_panel(self):
         """Create the properties panel."""
         dock = QDockWidget("Properties", self)
@@ -1031,8 +1145,14 @@ Connection Types:
                 scenario = ScenarioPresets.hospital_scenario()
             elif preset_name == "university":
                 scenario = ScenarioPresets.university_scenario()
+            elif preset_name == "fire_evacuation":
+                scenario = ScenarioPresets.fire_evacuation_scenario()
             else:
                 return
+                
+            # Clear previous custom room settings on new preset
+            self.custom_room_settings.clear()
+            self._on_space_selected(self.currently_selected_space_id)
                 
             # Initialize simulation
             sim_model = self.simulation_engine.initialize_simulation(

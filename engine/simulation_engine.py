@@ -242,6 +242,9 @@ class SimulationScenario:
     # Goals
     goals: Dict[str, Any] = field(default_factory=dict)
 
+    # Custom assignments
+    custom_room_agents: Dict[str, int] = field(default_factory=dict)
+
     # NEW v2.0: Model selection for the whole scenario
     default_movement_model: str = "basic"
 
@@ -891,6 +894,18 @@ class BIMSimulationModel(Model):
 
     def _initialize_agents(self):
         """Create agents based on scenario."""
+        
+        # 1. Custom room assignments
+        if self.scenario.custom_room_agents and self.bim_model and self.bim_model.spaces:
+            profile = self.scenario.agent_profiles[0] if self.scenario.agent_profiles else None
+            if profile:
+                for space_id, count in self.scenario.custom_room_agents.items():
+                    for _ in range(count):
+                        self._create_agent(profile, target_space_id=space_id)
+        
+        # 2. General assignments (fallback to random if custom_room_agents doesn't override them)
+        # Note: If custom room assignments are meant to completely replace general, 
+        # the user should pass agent_counts={} in the scenario.
         for profile in self.scenario.agent_profiles:
             count = self.scenario.agent_counts.get(profile.id, 1)
             for _ in range(count):
@@ -929,7 +944,7 @@ class BIMSimulationModel(Model):
 
             logger.info(f"Group '{gid}': {len(members)} agents linked, leader={leader.unique_id}")
 
-    def _create_agent(self, profile: AgentProfile, position: Optional[Tuple] = None) -> BIMAgent:
+    def _create_agent(self, profile: AgentProfile, position: Optional[Tuple] = None, target_space_id: Optional[str] = None) -> BIMAgent:
         """Create a new agent in the simulation."""
         agent_id = self.next_agent_id
         self.next_agent_id += 1
@@ -941,11 +956,46 @@ class BIMSimulationModel(Model):
             agent.position = np.array(position, dtype=float)
         else:
             if self.bim_model and self.bim_model.spaces:
-                space = random.choice(list(self.bim_model.spaces.values()))
-                if space.center:
+                space = None
+                if target_space_id and target_space_id in self.bim_model.spaces:
+                    space = self.bim_model.spaces[target_space_id]
+                else:
+                    # Filter spaces based on keywords
+                    excluded_keywords = ["roof", "shaft", "duct", "plenum", "void", "exterior", "ceiling"]
+                    valid_spaces = []
+                    for s in self.bim_model.spaces.values():
+                        name_lower = (s.name or "").lower()
+                        long_name_lower = (s.long_name or "").lower()
+                        if not any(kw in name_lower or kw in long_name_lower for kw in excluded_keywords):
+                            valid_spaces.append(s)
+                    
+                    # Fallback if everything was filtered out
+                    if not valid_spaces:
+                        valid_spaces = list(self.bim_model.spaces.values())
+                    
+                    # Weight by area
+                    weights = [max(getattr(s, "area", 1.0) or 1.0, 1.0) for s in valid_spaces]
+                    
+                    # Choose space
+                    space = random.choices(valid_spaces, weights=weights, k=1)[0]
+                
+                if space and space.center:
+                    # Safe offset logic
+                    offset_x = random.uniform(-1, 1)
+                    offset_y = random.uniform(-1, 1)
+                    
+                    if hasattr(space, "bounds") and space.bounds and len(space.bounds) >= 4:
+                        # Assuming bounds: (min_x, max_x, min_y, max_y, ...)
+                        min_x, max_x, min_y, max_y = space.bounds[0:4]
+                        width = max_x - min_x
+                        height = max_y - min_y
+                        if width > 0 and height > 0:
+                            offset_x = random.uniform(-width/4, width/4)
+                            offset_y = random.uniform(-height/4, height/4)
+                    
                     agent.position = np.array([
-                        space.center[0] + random.uniform(-2, 2),
-                        space.center[1] + random.uniform(-2, 2),
+                        space.center[0] + offset_x,
+                        space.center[1] + offset_y,
                         space.center[2] if len(space.center) > 2 else 0.0
                     ], dtype=float)
                     agent.current_space = space.id

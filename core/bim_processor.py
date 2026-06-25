@@ -86,6 +86,7 @@ class BIMSpace:
     category: str = "space"
     adjacent_spaces: List[str] = field(default_factory=list)
     connected_doors: List[str] = field(default_factory=list)
+    occupancy_capacity: Optional[int] = None
 
 
 @dataclass
@@ -225,6 +226,7 @@ class BIMProcessor:
             # Get area and volume from quantities
             area = 0.0
             volume = 0.0
+            occupancy_capacity = None
             if hasattr(space, "IsDefinedBy"):
                 for rel in space.IsDefinedBy:
                     if hasattr(rel, "RelatingPropertyDefinition"):
@@ -235,6 +237,17 @@ class BIMProcessor:
                                     area = q.AreaValue
                                 elif q.Name == "NetVolume" and hasattr(q, "VolumeValue"):
                                     volume = q.VolumeValue
+                        if hasattr(pset, "HasProperties"):
+                            for prop in pset.HasProperties:
+                                if prop.Name in ["OccupancyNumber", "Occupancy", "Capacity"] and hasattr(prop, "NominalValue"):
+                                    try:
+                                        val = prop.NominalValue
+                                        if hasattr(val, "wrappedValue"):
+                                            occupancy_capacity = int(float(val.wrappedValue))
+                                        else:
+                                            occupancy_capacity = int(float(val))
+                                    except (ValueError, TypeError, AttributeError):
+                                        pass
 
             # Get bounds
             geometry, bounds, center = self._get_element_geometry_and_bounds(space)
@@ -253,7 +266,8 @@ class BIMProcessor:
                 bounds=bounds,
                 center=center,
                 geometry=geometry,
-                category=category
+                category=category,
+                occupancy_capacity=occupancy_capacity
             )
             spaces[str(space.id())] = bim_space
 
