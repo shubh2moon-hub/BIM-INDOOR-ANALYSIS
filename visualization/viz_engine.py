@@ -18,7 +18,6 @@ from core.bim_processor import BIMModel, BIMSpace, BIMElement, ElementCategory
 from core.spatial_engine import SpatialGraph, SpaceNode, Connection
 from engine.simulation_engine import BIMSimulationModel, BIMAgent, AgentState
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -41,9 +40,10 @@ class VisualizationSettings:
     show_furniture: bool = True
     show_stairs: bool = True
     show_spaces: bool = True
-    show_labels: bool = False
+    show_labels: bool = True
     show_navigation: bool = False
-    show_spatial_graph: bool = False
+    show_spatial_graph: bool = True
+    show_evacuation_paths: bool = False
     level_filter: Optional[str] = None
     
     # Agent visualization
@@ -109,6 +109,9 @@ class Visualization3D(QObject):
         self.space_actors: Dict[str, Any] = {}
         self.element_actors: Dict[str, Any] = {}
         self.label_actors: Dict[str, Any] = {}
+        self.path_actors: Dict[str, Any] = {}       # evacuation path actors
+        self.exit_actors: Dict[str, Any] = {}       # virtual exit marker actors
+        self.trail_actors: Dict[int, Any] = {}      # agent trail/trace actors
         
         # Update timer
         self.update_timer: Optional[QTimer] = None
@@ -133,8 +136,9 @@ class Visualization3D(QObject):
 
         # Enable picking
         try:
-            self.plotter.enable_element_picking(
+            self.plotter.enable_mesh_picking(
                 callback=self._on_element_picked,
+                left_clicking=True,
                 show=False
             )
         except Exception as e:
@@ -166,10 +170,179 @@ class Visualization3D(QObject):
         # Display spatial graph if available
         if self.spatial_graph and self.settings.show_spatial_graph:
             self._display_spatial_graph()
+        
+        # Display evacuation paths if available
+        if self.spatial_graph and self.settings.show_evacuation_paths:
+            self.display_evacuation_paths()
+        
+        # Display exit markers
+        self.display_exits()
             
         # Reset camera
         if self.plotter:
             self.plotter.reset_camera()
+            
+    # ------------------------------------------------------------------
+    # Evacuation Path Visualization
+    # ------------------------------------------------------------------
+    
+    def display_evacuation_paths(self):
+        """Display multicolored evacuation paths from every space to the nearest exit."""
+        if not self.plotter or not self.current_model or not self.spatial_graph:
+            return
+        
+        self.clear_evacuation_paths()
+        
+        if not self.spatial_graph.evacuation_paths:
+            logger.info("No evacuation paths to display")
+            return
+        
+        # Generate distinct colors using HSV colormap
+        n_paths = len(self.spatial_graph.evacuation_paths)
+        colors = self._generate_path_colors(n_paths)
+        
+        color_idx = 0
+        for space_node_id, path in self.spatial_graph.evacuation_paths.items():
+            if len(path) < 2:
+                continue
+            
+            # Get 3D points along the path
+            points = []
+            for node_id in path:
+                space_id = node_id.replace("space_", "")
+                if space_id in self.current_model.spaces:
+                    space = self.current_model.spaces[space_id]
+                    if space.center:
+                        points.append(space.center)
+            
+            if len(points) < 2:
+                continue
+            
+            # Create a line from the points
+            line_points = np.array(points)
+            
+            # Create tube for visibility
+            try:
+                # Use PolyData with lines
+                poly = pv.PolyData(line_points)
+                # Create line cells
+                cells = np.full((len(points) - 1, 3), 2, dtype=np.int_)
+                cells[:, 1] = np.arange(0, len(points) - 1)
+                cells[:, 2] = np.arange(1, len(points))
+                poly.lines = cells.flatten()
+                
+                # Tube for thickness
+                tube = poly.tube(radius=0.15)
+                
+                color = colors[color_idx % len(colors)]
+                color_idx += 1
+                
+                actor = self.plotter.add_mesh(
+                    tube,
+                    color=color,
+                    opacity=0.7,
+                    smooth_shading=True,
+                    name=f"path_{space_node_id}"
+                )
+                self.path_actors[space_node_id] = actor
+            except Exception as e:
+                logger.warning(f"Could not render path for {space_node_id}: {e}")
+        
+        logger.info(f"Displayed {len(self.path_actors)} evacuation paths")
+    
+    def _generate_path_colors(self, n: int) -> List[Tuple[float, float, float]]:
+        """Generate a list of distinct colors for paths."""
+        import colorsys
+        colors = []
+        for i in range(max(n, 1)):
+            h = (i * 0.618033988749895) % 1.0  # golden ratio for even distribution
+            s = 0.7 + (i % 3) * 0.1
+            v = 0.8 + (i % 2) * 0.1
+            r, g, b = colorsys.hsv_to_rgb(h, min(s, 1.0), min(v, 1.0))
+            colors.append((r, g, b))
+        return colors
+    
+    def highlight_evacuation_path(self, space_id: str):
+        """Highlight a single evacuation path and dim others."""
+        if not self.plotter or not self.spatial_graph:
+            return
+        
+        target_node_id = f"space_{space_id}"
+        
+        for path_id, actor in self.path_actors.items():
+            if path_id == target_node_id:
+                try:
+                    actor.GetProperty().SetOpacity(1.0)
+                    actor.GetProperty().SetLineWidth(5.0)
+                except Exception:
+                    pass
+            else:
+                try:
+                    actor.GetProperty().SetOpacity(0.15)
+                except Exception:
+                    pass
+        
+        self.plotter.render()
+    
+    def clear_evacuation_paths(self):
+        """Remove all evacuation path actors from the view."""
+        if not self.plotter:
+            return
+        for actor in self.path_actors.values():
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:
+                pass
+        self.path_actors.clear()
+    
+    def display_exits(self):
+        """Display markers for annotated exits and virtual exits."""
+        if not self.plotter or not self.current_model:
+            return
+        
+        # Clear old exit markers
+        for actor in self.exit_actors.values():
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:
+                pass
+        self.exit_actors.clear()
+        
+        # Exit marker color: bright green
+        exit_color = (0.1, 0.9, 0.2)
+        
+        # 1. Show annotated exit spaces
+        if self.current_model.annotations:
+            for space_id, ann in self.current_model.annotations.space_annotations.items():
+                if ann.is_exit and space_id in self.current_model.spaces:
+                    space = self.current_model.spaces[space_id]
+                    if space.center:
+                        sphere = pv.Sphere(radius=0.6, center=space.center, theta_resolution=12, phi_resolution=12)
+                        actor = self.plotter.add_mesh(sphere, color=exit_color, opacity=0.9, name=f"exit_{space_id}")
+                        self.exit_actors[f"exit_{space_id}"] = actor
+            
+            # 2. Show virtual exits
+            for v_exit in self.current_model.annotations.exits:
+                sphere = pv.Sphere(radius=0.6, center=v_exit.position, theta_resolution=12, phi_resolution=12)
+                actor = self.plotter.add_mesh(sphere, color=exit_color, opacity=0.9, name=f"v_exit_{v_exit.id}")
+                
+                # Add label
+                label_actor = self.plotter.add_point_labels(
+                    [v_exit.position],
+                    [v_exit.name or "Exit"],
+                    font_size=10,
+                    name=f"v_exit_label_{v_exit.id}"
+                )
+                self.exit_actors[f"v_exit_{v_exit.id}"] = actor
+                self.exit_actors[f"v_exit_label_{v_exit.id}"] = label_actor
+    
+    def set_show_evacuation_paths(self, show: bool):
+        """Toggle evacuation path visibility."""
+        self.settings.show_evacuation_paths = show
+        if show:
+            self.display_evacuation_paths()
+        else:
+            self.clear_evacuation_paths()
             
     def _display_elements(self):
         """Display BIM building elements."""
@@ -348,32 +521,46 @@ class Visualization3D(QObject):
                 (0.9, 0.9, 0.9)
             )
             
-            # Create space representation (sphere at center for now)
+            # Create space representation
             center = space.center
             radius = max(0.5, (space.area / np.pi) ** 0.5 * 0.3) if space.area > 0 else 1.0
             
-            sphere = pv.Sphere(
-                radius=radius,
-                center=center,
-                theta_resolution=16,
-                phi_resolution=16
-            )
+            mesh = None
+            if getattr(space, 'geometry', None) and isinstance(space.geometry, dict) and "boundary" in space.geometry:
+                boundary = space.geometry["boundary"]
+                if boundary and len(boundary) >= 3:
+                    pts = np.array([[pt[0], pt[1], center[2] + 0.05] for pt in boundary], dtype=np.float32)
+                    faces = np.hstack([[len(pts)], np.arange(len(pts))])
+                    mesh = pv.PolyData(pts, faces)
+                    
+            if mesh is None:
+                mesh = pv.Sphere(
+                    radius=radius,
+                    center=center,
+                    theta_resolution=16,
+                    phi_resolution=16
+                )
             
             actor = self.plotter.add_mesh(
-                sphere,
+                mesh,
                 color=color,
-                opacity=0.3,
+                opacity=0.6,
                 name=f"space_{space_id}"
             )
             self.space_actors[space_id] = actor
             
             # Add label if enabled
             if self.settings.show_labels:
+                # Offset label slightly upward to prevent z-fighting with the sphere/floor
+                label_pos = [center[0], center[1], center[2] + radius + 0.2]
                 label_actor = self.plotter.add_point_labels(
-                    [center],
+                    [label_pos],
                     [space.name],
-                    font_size=10,
-                    name=f"label_{space_id}"
+                    font_size=12,
+                    name=f"label_{space_id}",
+                    text_color="black",
+                    shape_color="white",
+                    shape_opacity=0.5
                 )
                 self.label_actors[space_id] = label_actor
                 
@@ -382,35 +569,33 @@ class Visualization3D(QObject):
         if not self.spatial_graph or not self.plotter:
             return
             
+        # Color map for connection types
+        conn_colors = {
+            "door": (0.2, 0.8, 0.2),
+            "stair": (0.8, 0.2, 0.2),
+            "elevator": (0.2, 0.2, 0.8),
+            "corridor": (0.9, 0.6, 0.2),
+            "open": (0.6, 0.6, 0.6),
+            "exit": (0.1, 0.9, 0.2),
+        }
+        
         # Draw connections as lines
-        lines = []
+        i = 0
         for conn in self.spatial_graph.connections.values():
             source = self.spatial_graph.nodes.get(conn.source_id)
             target = self.spatial_graph.nodes.get(conn.target_id)
             
             if source and target:
-                lines.append([source.center, target.center])
-                
-        if lines:
-            for i, line_points in enumerate(lines):
-                line = pv.Line(*line_points)
-                
-                # Color by connection type
-                color = (0.5, 0.5, 0.5)  # default gray
-                if hasattr(line_points, 'connection_type'):
-                    if line_points.connection_type == "door":
-                        color = (0.2, 0.8, 0.2)
-                    elif line_points.connection_type == "stair":
-                        color = (0.8, 0.2, 0.2)
-                    elif line_points.connection_type == "elevator":
-                        color = (0.2, 0.2, 0.8)
+                line = pv.Line(source.center, target.center)
+                color = conn_colors.get(conn.connection_type, (0.5, 0.5, 0.5))
                         
-                actor = self.plotter.add_mesh(
+                self.plotter.add_mesh(
                     line,
                     color=color,
                     line_width=2,
                     name=f"graph_line_{i}"
                 )
+                i += 1
                 
         # Draw nodes
         for node_id, node in self.spatial_graph.nodes.items():
@@ -566,12 +751,77 @@ class Visualization3D(QObject):
             )
             self.agent_actors[agent.unique_id] = actor
 
+        # Draw trail lines if enabled
+        if self.settings.show_trails:
+            self._update_trails(agents)
+
         # Render immediately so agents appear without waiting for the timer
         try:
             self.plotter.render()
         except Exception:
             pass
             
+    def _update_trails(self, agents):
+        """Draw trail lines from each agent's position_history."""
+        if not self.plotter:
+            return
+
+        # Remove stale trail actors for agents that no longer exist
+        live_ids = {a.unique_id for a in agents}
+        dead_trail_ids = set(self.trail_actors.keys()) - live_ids
+        for agent_id in dead_trail_ids:
+            try:
+                self.plotter.remove_actor(self.trail_actors[agent_id])
+            except Exception:
+                pass
+            del self.trail_actors[agent_id]
+
+        trail_length = self.settings.agent_trail_length
+
+        for agent in agents:
+            # Remove previous trail actor for this agent
+            if agent.unique_id in self.trail_actors:
+                try:
+                    self.plotter.remove_actor(self.trail_actors[agent.unique_id])
+                except Exception:
+                    pass
+
+            history = list(agent.position_history)[-trail_length:]
+            if len(history) < 2:
+                continue
+
+            # Build 3D point array from position history
+            points = np.array(history, dtype=np.float64)
+            # Ensure 3D (some histories may be 2-tuples)
+            if points.shape[1] < 3:
+                z_col = np.zeros((points.shape[0], 1))
+                points = np.hstack([points, z_col])
+
+            # Create polyline
+            n_pts = len(points)
+            poly = pv.PolyData(points)
+            cells = np.full((n_pts - 1, 3), 2, dtype=np.int_)
+            cells[:, 1] = np.arange(0, n_pts - 1)
+            cells[:, 2] = np.arange(1, n_pts)
+            poly.lines = cells.flatten()
+
+            try:
+                tube = poly.tube(radius=0.05)
+                # Use the agent's state color with reduced opacity
+                color = self.settings.agent_state_colors.get(
+                    agent.state.value, (0.5, 0.5, 0.5)
+                )
+                actor = self.plotter.add_mesh(
+                    tube,
+                    color=color,
+                    opacity=0.4,
+                    smooth_shading=True,
+                    name=f"trail_{agent.unique_id}",
+                )
+                self.trail_actors[agent.unique_id] = actor
+            except Exception as e:
+                logger.debug(f"Could not render trail for agent {agent.unique_id}: {e}")
+
     def _update_density_map(self):
         """Update density heat map visualization."""
         if not self.current_simulation:
@@ -610,14 +860,17 @@ class Visualization3D(QObject):
             self.settings.show_navigation = False
         elif mode == VisualizationMode.AGENTS:
             self.settings.show_agents = True
-            self.settings.show_trails = False
+            self.settings.show_trails = True
         elif mode == VisualizationMode.DENSITY:
             self.settings.show_agents = True
         elif mode == VisualizationMode.EVACUATION:
             self.settings.show_agents = True
+            self.settings.show_trails = True
+            self.settings.show_evacuation_paths = True
         elif mode == VisualizationMode.NAVIGATION:
             self.settings.show_navigation = True
             self.settings.show_spatial_graph = True
+            self.settings.show_evacuation_paths = True
             
         self.refresh()
         
@@ -641,9 +894,12 @@ class Visualization3D(QObject):
         self.plotter.clear()
         self.actors.clear()
         self.agent_actors.clear()
+        self.trail_actors.clear()
         self.space_actors.clear()
         self.element_actors.clear()
         self.label_actors.clear()
+        self.path_actors.clear()
+        self.exit_actors.clear()
         
     def reset_camera(self):
         """Reset camera to default view."""
@@ -685,38 +941,29 @@ class Visualization3D(QObject):
         logger.info(f"Picked element: {picked}")
         
         # Try to identify what was picked
+        def is_match(actor, picked_item):
+            if actor == picked_item:
+                return True
+            try:
+                if hasattr(actor, 'mapper') and actor.mapper and actor.mapper.dataset == picked_item:
+                    return True
+                if hasattr(actor, 'GetMapper') and actor.GetMapper() and actor.GetMapper().GetInput() == picked_item:
+                    return True
+            except Exception:
+                pass
+            return False
+            
         for agent_id, actor in self.agent_actors.items():
-            if actor == picked:
+            if is_match(actor, picked):
                 self.agent_selected.emit(agent_id)
                 return
                 
         for space_id, actor in self.space_actors.items():
-            if actor == picked:
+            if is_match(actor, picked):
                 self.space_selected.emit(space_id)
                 return
                 
-    def show_legend(self):
-        """Show legend for current visualization."""
-        if not self.plotter:
-            return
-            
-        legend_entries = []
-        
-        # Agent states
-        for state, color in self.settings.agent_state_colors.items():
-            legend_entries.append([state.capitalize(), color])
-            
-        # Space types
-        for space_type, color in self.settings.space_colors.items():
-            legend_entries.append([space_type.capitalize(), color])
-            
-        self.plotter.add_legend(legend_entries)
-        
-    def show_scale_bar(self):
-        """Show scale bar in the 3D view."""
-        if self.plotter:
-            self.plotter.add_scalar_bar("Density")
-            
+
     def toggle_element_category(self, category: ElementCategory, visible: bool):
         """Toggle visibility of an element category."""
         category_names = {
@@ -765,7 +1012,7 @@ class Visualization3D(QObject):
         if not self.current_simulation or not self.plotter:
             return
             
-        for agent in self.current_simulation.schedule.agents:
+        for agent in self._get_agents(self.current_simulation):
             if agent.unique_id == agent_id:
                 self.plotter.camera.SetFocalPoint(
                     agent.position[0],

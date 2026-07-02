@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QProgressBar, QFrame, QApplication, QStyle, QSizePolicy,
-    QMenu, QToolButton, QWidgetAction
+    QMenu, QToolButton, QWidgetAction, QInputDialog
 )
 
 from core.bim_processor import BIMProcessor, BIMModel, BIMSpace, BIMElement, ElementCategory
@@ -27,7 +27,6 @@ from core.spatial_engine import SpatialIntelligenceEngine, SpatialGraph
 from engine.simulation_engine import SimulationEngine, BIMSimulationModel, ScenarioPresets
 from visualization.viz_engine import Visualization3D, VisualizationSettings, VisualizationMode
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -150,6 +149,17 @@ class MainWindow(QMainWindow):
         process_spatial_action = QAction("&Process Spatial Intelligence", self)
         process_spatial_action.triggered.connect(self._on_process_spatial)
         model_menu.addAction(process_spatial_action)
+        
+        model_menu.addSeparator()
+        
+        # Annotation actions
+        show_paths_action = QAction("Show &All Escape Routes", self)
+        show_paths_action.triggered.connect(self._on_show_all_paths_clicked)
+        model_menu.addAction(show_paths_action)
+        
+        hide_paths_action = QAction("&Hide All Paths", self)
+        hide_paths_action.triggered.connect(self._on_hide_paths_clicked)
+        model_menu.addAction(hide_paths_action)
         
         model_menu.addSeparator()
         
@@ -405,32 +415,148 @@ class MainWindow(QMainWindow):
         self.panels["Project"] = dock
         
     def _create_room_config_panel(self):
-        """Create the room configurator panel."""
+        """Create the comprehensive room configurator panel."""
         dock = QDockWidget("Room Configurator", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(8)
+        
+        # --- Section: Selected Space Info ---
+        info_group = QGroupBox("Selected Space")
+        info_layout = QVBoxLayout(info_group)
         
         self.lbl_selected_room = QLabel("Selected Room: None")
-        self.lbl_selected_room.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.lbl_selected_room)
+        self.lbl_selected_room.setStyleSheet("font-weight: bold; font-size: 12px;")
+        info_layout.addWidget(self.lbl_selected_room)
+        
+        self.lbl_room_ifc_category = QLabel("IFC Category: —")
+        info_layout.addWidget(self.lbl_room_ifc_category)
         
         self.lbl_room_occupancy = QLabel("IFC Occupancy: N/A")
-        layout.addWidget(self.lbl_room_occupancy)
+        info_layout.addWidget(self.lbl_room_occupancy)
         
-        layout.addWidget(QLabel("Number of Agents:"))
-        self.spin_room_agents = QSpinBox()
-        self.spin_room_agents.setRange(0, 1000)
-        self.spin_room_agents.setEnabled(False)
-        layout.addWidget(self.spin_room_agents)
+        layout.addWidget(info_group)
+        
+        # --- Section: Category Override ---
+        cat_group = QGroupBox("Space Type Override")
+        cat_layout = QVBoxLayout(cat_group)
+        
+        self.combo_category_override = QComboBox()
+        self.combo_category_override.addItem("Use IFC Default", None)
+        for cat in ["room", "corridor", "staircase", "elevator", "restroom", "office", "meeting", "public", "entrance", "exit", "lobby", "void"]:
+            self.combo_category_override.addItem(cat.replace("_", " ").title(), cat)
+        self.combo_category_override.setEnabled(False)
+        self.combo_category_override.currentIndexChanged.connect(self._on_category_override_changed)
+        cat_layout.addWidget(self.combo_category_override)
+        
+        layout.addWidget(cat_group)
+        
+        # --- Section: Exit & Safety ---
+        safety_group = QGroupBox("Exit & Safety")
+        safety_layout = QVBoxLayout(safety_group)
+        
+        self.chk_mark_exit = QCheckBox("Mark as Exit")
+        self.chk_mark_exit.setEnabled(False)
+        self.chk_mark_exit.setToolTip("This space is an exit / leads to the outside")
+        safety_layout.addWidget(self.chk_mark_exit)
         
         self.chk_start_fire = QCheckBox("Set as Fire Origin")
         self.chk_start_fire.setEnabled(False)
-        layout.addWidget(self.chk_start_fire)
+        safety_layout.addWidget(self.chk_start_fire)
         
-        self.btn_apply_room = QPushButton("Apply to Room")
+        self.chk_block_path = QCheckBox("Block Path (unreachable)")
+        self.chk_block_path.setEnabled(False)
+        self.chk_block_path.setToolTip("Agents cannot walk through this space")
+        safety_layout.addWidget(self.chk_block_path)
+        
+        layout.addWidget(safety_group)
+        
+        # --- Section: Agents ---
+        agents_group = QGroupBox("Agents")
+        agents_layout = QVBoxLayout(agents_group)
+        
+        agents_row = QHBoxLayout()
+        agents_row.addWidget(QLabel("Number of Agents:"))
+        self.spin_room_agents = QSpinBox()
+        self.spin_room_agents.setRange(0, 1000)
+        self.spin_room_agents.setEnabled(False)
+        agents_row.addWidget(self.spin_room_agents)
+        agents_layout.addLayout(agents_row)
+        
+        layout.addWidget(agents_group)
+        
+        # --- Section: Evacuation Path ---
+        path_group = QGroupBox("Evacuation Path")
+        path_layout = QVBoxLayout(path_group)
+        
+        self.lbl_path_preview = QLabel("Path: —")
+        self.lbl_path_preview.setWordWrap(True)
+        path_layout.addWidget(self.lbl_path_preview)
+        
+        btn_show_path = QPushButton("Show Path from This Room")
+        btn_show_path.clicked.connect(self._on_show_path_clicked)
+        btn_show_path.setEnabled(False)
+        self.btn_show_path = btn_show_path
+        path_layout.addWidget(btn_show_path)
+        
+        layout.addWidget(path_group)
+        
+        # --- Section: Virtual Exits (global) ---
+        v_exit_group = QGroupBox("Virtual Exits")
+        v_exit_layout = QVBoxLayout(v_exit_group)
+        
+        self.lbl_virtual_exits = QLabel("No virtual exits added")
+        self.lbl_virtual_exits.setWordWrap(True)
+        v_exit_layout.addWidget(self.lbl_virtual_exits)
+        
+        btn_add_v_exit = QPushButton("Add Virtual Exit at Selected Space")
+        btn_add_v_exit.clicked.connect(self._on_add_virtual_exit)
+        btn_add_v_exit.setEnabled(False)
+        self.btn_add_v_exit = btn_add_v_exit
+        v_exit_layout.addWidget(btn_add_v_exit)
+        
+        layout.addWidget(v_exit_group)
+        
+        # --- Section: Virtual Spaces (global) ---
+        v_space_group = QGroupBox("Virtual Spaces")
+        v_space_layout = QVBoxLayout(v_space_group)
+        
+        self.lbl_virtual_spaces = QLabel("No virtual spaces added")
+        self.lbl_virtual_spaces.setWordWrap(True)
+        v_space_layout.addWidget(self.lbl_virtual_spaces)
+        
+        btn_add_v_space = QPushButton("Add Virtual Space at Camera Center")
+        btn_add_v_space.clicked.connect(self._on_add_virtual_space)
+        btn_add_v_space.setToolTip("Creates a virtual room at the current camera focal point")
+        v_space_layout.addWidget(btn_add_v_space)
+        
+        layout.addWidget(v_space_group)
+        
+        # --- Section: Global Actions ---
+        global_group = QGroupBox("Global Actions")
+        global_layout = QVBoxLayout(global_group)
+        
+        btn_show_all = QPushButton("Show All Escape Routes")
+        btn_show_all.clicked.connect(self._on_show_all_paths_clicked)
+        global_layout.addWidget(btn_show_all)
+        
+        btn_hide_all = QPushButton("Hide All Paths")
+        btn_hide_all.clicked.connect(self._on_hide_paths_clicked)
+        global_layout.addWidget(btn_hide_all)
+        
+        btn_recompute = QPushButton("Recompute Spatial Graph")
+        btn_recompute.clicked.connect(self._on_recompute_graph_clicked)
+        btn_recompute.setStyleSheet("background-color: #0078d4; color: white;")
+        global_layout.addWidget(btn_recompute)
+        
+        layout.addWidget(global_group)
+        
+        # --- Apply Button ---
+        self.btn_apply_room = QPushButton("Apply & Recompute")
         self.btn_apply_room.setEnabled(False)
+        self.btn_apply_room.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
         self.btn_apply_room.clicked.connect(self._on_apply_room_config)
         layout.addWidget(self.btn_apply_room)
         
@@ -442,58 +568,111 @@ class MainWindow(QMainWindow):
 
     def _on_space_selected(self, space_id: str):
         self.currently_selected_space_id = space_id
-        if self.current_model and space_id in self.current_model.spaces:
-            space = self.current_model.spaces[space_id]
-            self.lbl_selected_room.setText(f"Selected Room: {space.name}")
-            
-            occupancy = space.occupancy_capacity
-            if occupancy is not None:
-                self.lbl_room_occupancy.setText(f"IFC Occupancy: {occupancy}")
-            else:
-                self.lbl_room_occupancy.setText("IFC Occupancy: N/A")
-                
-            settings = self.custom_room_settings.get(space_id, {})
-            
-            self.spin_room_agents.setEnabled(True)
-            self.spin_room_agents.setValue(settings.get("agents", occupancy or 0))
-            
-            self.chk_start_fire.setEnabled(True)
-            self.chk_start_fire.setChecked(settings.get("fire", False))
-            
-            self.btn_apply_room.setEnabled(True)
-        else:
+        
+        has_model = self.current_model is not None and space_id in self.current_model.spaces
+        
+        self.combo_category_override.setEnabled(has_model)
+        self.chk_mark_exit.setEnabled(has_model)
+        self.chk_start_fire.setEnabled(has_model)
+        self.chk_block_path.setEnabled(has_model)
+        self.spin_room_agents.setEnabled(has_model)
+        self.btn_show_path.setEnabled(has_model)
+        self.btn_add_v_exit.setEnabled(has_model)
+        self.btn_apply_room.setEnabled(has_model)
+        
+        if not has_model:
             self.lbl_selected_room.setText("Selected Room: None")
+            self.lbl_room_ifc_category.setText("IFC Category: —")
             self.lbl_room_occupancy.setText("IFC Occupancy: N/A")
-            self.spin_room_agents.setEnabled(False)
-            self.chk_start_fire.setEnabled(False)
-            self.btn_apply_room.setEnabled(False)
+            self.lbl_path_preview.setText("Path: —")
+            return
+        
+        space = self.current_model.spaces[space_id]
+        self.lbl_selected_room.setText(f"Selected Room: {space.name}")
+        self.lbl_room_ifc_category.setText(f"IFC Category: {space.category}")
+        
+        occupancy = space.occupancy_capacity
+        if occupancy is not None:
+            self.lbl_room_occupancy.setText(f"IFC Occupancy: {occupancy}")
+        else:
+            self.lbl_room_occupancy.setText("IFC Occupancy: N/A")
+        
+        # Load annotations if they exist
+        ann = None
+        if self.current_model.annotations and space_id in self.current_model.annotations.space_annotations:
+            ann = self.current_model.annotations.space_annotations[space_id]
+        
+        # Category override
+        current_cat = ann.category_override if ann else None
+        idx = self.combo_category_override.findData(current_cat)
+        self.combo_category_override.setCurrentIndex(idx if idx >= 0 else 0)
+        
+        # Safety checkboxes
+        self.chk_mark_exit.setChecked(ann.is_exit if ann else False)
+        self.chk_start_fire.setChecked(ann.is_fire_origin if ann else False)
+        self.chk_block_path.setChecked(ann.block_path if ann else False)
+        
+        # Agent count
+        agent_count = ann.agent_count if ann else (occupancy or 0)
+        self.spin_room_agents.setValue(agent_count)
+        
+        # Path preview
+        self._update_path_preview(space_id)
+        
+        # Update virtual exit list
+        self._update_virtual_exit_list()
+        
+        # Update virtual space list
+        self._update_virtual_space_list()
 
     def _on_apply_room_config(self):
-        if self.currently_selected_space_id:
-            space_id = self.currently_selected_space_id
-            self.custom_room_settings[space_id] = {
-                "agents": self.spin_room_agents.value(),
-                "fire": self.chk_start_fire.isChecked()
-            }
-            self.log_message(f"Applied custom settings to space {space_id}")
-            
-            if self.current_simulation and not self.is_simulation_running:
-                self.log_message("Re-initializing scenario with new room config...")
+        """Apply all room configurator settings and recompute."""
+        if not self.currently_selected_space_id or not self.current_model:
+            return
+        
+        space_id = self.currently_selected_space_id
+        
+        # Ensure annotations exist
+        if not self.current_model.annotations:
+            from core.model_annotations import ModelAnnotations
+            self.current_model.annotations = ModelAnnotations()
+        
+        ann = self.current_model.annotations
+        
+        # Save annotation values
+        cat_override = self.combo_category_override.currentData()
+        ann.set_category_override(space_id, cat_override)
+        ann.set_is_exit(space_id, self.chk_mark_exit.isChecked())
+        ann.set_is_fire_origin(space_id, self.chk_start_fire.isChecked())
+        ann.set_block_path(space_id, self.chk_block_path.isChecked())
+        ann.set_agent_count(space_id, self.spin_room_agents.value())
+        
+        self.log_message(f"Applied annotations to space {space_id}")
+        
+        # Recompute spatial graph immediately
+        self._on_recompute_graph_clicked()
+        
+        # Update simulation if one exists and is not running
+        if self.current_simulation and not self.is_simulation_running:
+            self.log_message("Re-initializing simulation with updated annotations...")
+            try:
                 scenario = self.current_simulation.scenario
                 
+                # Update custom room agents from all annotations
                 scenario.custom_room_agents.clear()
-                for s_id, conf in self.custom_room_settings.items():
-                    if conf["agents"] > 0:
-                        scenario.custom_room_agents[s_id] = conf["agents"]
+                for sid, a in ann.space_annotations.items():
+                    if a.agent_count > 0:
+                        scenario.custom_room_agents[sid] = a.agent_count
                 
-                scenario.events = [e for e in scenario.events if e.get("event_type") != "fire"]
-                for s_id, conf in self.custom_room_settings.items():
-                    if conf["fire"]:
-                        space = self.current_model.spaces[s_id]
+                # Rebuild fire events from annotations
+                scenario.events = [e for e in scenario.events if e.get("type") != "fire"]
+                for sid, a in ann.space_annotations.items():
+                    if a.is_fire_origin and sid in self.current_model.spaces:
+                        space = self.current_model.spaces[sid]
                         if space.center:
                             scenario.events.append({
                                 "time": 5,
-                                "event_type": "fire",
+                                "type": "fire",
                                 "location": list(space.center),
                                 "spread_rate": 0.5,
                                 "hazard_intensity": 1.0,
@@ -505,6 +684,259 @@ class MainWindow(QMainWindow):
                 )
                 self.current_simulation = sim_model
                 self.visualization.load_simulation(sim_model)
+                self.log_message("Simulation re-initialized with new annotations", "SUCCESS")
+            except Exception as e:
+                self.log_message(f"Simulation re-init failed: {e}", "ERROR")
+
+    def _on_category_override_changed(self, index):
+        """Handle category override dropdown change."""
+        if not self.currently_selected_space_id or not self.current_model:
+            return
+        data = self.combo_category_override.itemData(index)
+        if self.current_model.annotations:
+            self.current_model.annotations.set_category_override(self.currently_selected_space_id, data)
+
+    def _update_path_preview(self, space_id: str):
+        """Update the path preview label for the selected space."""
+        if not self.spatial_engine:
+            self.lbl_path_preview.setText("Path: —")
+            return
+        path = self.spatial_engine.get_evacuation_path(space_id)
+        if path and len(path) > 1:
+            names = []
+            for sid in path:
+                if sid in self.current_model.spaces:
+                    names.append(self.current_model.spaces[sid].name)
+                else:
+                    names.append(sid)
+            self.lbl_path_preview.setText("Path:\n" + " → ".join(names))
+        elif path and len(path) == 1:
+            self.lbl_path_preview.setText("Path: This space is the exit")
+        else:
+            self.lbl_path_preview.setText("Path: No route to exit found")
+
+    def _update_virtual_exit_list(self):
+        """Update the virtual exit list label."""
+        if not self.current_model or not self.current_model.annotations:
+            self.lbl_virtual_exits.setText("No virtual exits added")
+            return
+        exits = self.current_model.annotations.exits
+        if not exits:
+            self.lbl_virtual_exits.setText("No virtual exits added")
+            return
+        lines = [f"• {e.name} at ({e.position[0]:.1f}, {e.position[1]:.1f}, {e.position[2]:.1f})" for e in exits]
+        self.lbl_virtual_exits.setText("\n".join(lines))
+
+    def _update_virtual_space_list(self):
+        """Update the virtual space list label."""
+        if not self.current_model or not self.current_model.annotations:
+            self.lbl_virtual_spaces.setText("No virtual spaces added")
+            return
+        spaces = self.current_model.annotations.virtual_spaces
+        if not spaces:
+            self.lbl_virtual_spaces.setText("No virtual spaces added")
+            return
+        lines = [f"• {s.name} at ({s.position[0]:.1f}, {s.position[1]:.1f}, {s.position[2]:.1f})" for s in spaces]
+        self.lbl_virtual_spaces.setText("\n".join(lines))
+
+    def _on_show_path_clicked(self):
+        """Show the evacuation path for the currently selected room."""
+        if not self.currently_selected_space_id:
+            return
+        self.visualization.highlight_evacuation_path(self.currently_selected_space_id)
+        self.log_message(f"Highlighted evacuation path for {self.currently_selected_space_id}")
+
+    def _on_show_all_paths_clicked(self):
+        """Show all evacuation paths."""
+        self.visualization.set_show_evacuation_paths(True)
+        self.log_message("Showing all evacuation paths")
+
+    def _on_hide_paths_clicked(self):
+        """Hide all evacuation paths."""
+        self.visualization.set_show_evacuation_paths(False)
+        self.log_message("Hiding all evacuation paths")
+
+    def _on_add_virtual_exit(self):
+        """Add a virtual exit at the selected space's center."""
+        if not self.currently_selected_space_id or not self.current_model:
+            return
+        space = self.current_model.spaces[self.currently_selected_space_id]
+        if not space.center:
+            QMessageBox.warning(self, "Warning", "Selected space has no center position")
+            return
+        
+        name, ok = QInputDialog.getText(self, "Virtual Exit", "Enter exit name:", text=f"Exit - {space.name}")
+        if not ok or not name:
+            return
+        
+        if self.current_model.annotations:
+            self.current_model.annotations.add_virtual_exit(
+                name=name,
+                position=space.center,
+                level_id=space.level,
+                width=1.2
+            )
+            self.log_message(f"Added virtual exit '{name}' at {space.name}")
+            self._update_virtual_exit_list()
+
+    def _on_add_virtual_space(self):
+        """Add a virtual space at the camera focal point, extracting boundaries via raycasting."""
+        if not self.current_model or not self.visualization.plotter:
+            QMessageBox.warning(self, "Warning", "No model loaded or 3D view not ready")
+            return
+            
+        # Get camera focal point
+        focal_point = self.visualization.plotter.camera.GetFocalPoint()
+        cx, cy, cz = focal_point
+        
+        name, ok = QInputDialog.getText(self, "Virtual Space", "Enter space name:", text=f"Virtual Room {len(self.current_model.annotations.virtual_spaces) + 1 if self.current_model.annotations else 1}")
+        if not ok or not name:
+            return
+            
+        from core.model_annotations import VALID_SPACE_CATEGORIES
+        category, ok = QInputDialog.getItem(self, "Virtual Space Category", "Select category:", VALID_SPACE_CATEGORIES, 0, False)
+        if not ok or not category:
+            return
+            
+        # Raycasting to find boundary
+        self.statusbar.showMessage("Extracting room boundary using raycasting...")
+        import math
+        from shapely.geometry import box, Point, LineString, Polygon
+        from shapely.ops import unary_union
+        
+        obstacles = []
+        for elem in self.current_model.elements.values():
+            if elem.category in [ElementCategory.WALL, ElementCategory.WINDOW, ElementCategory.DOOR, ElementCategory.COLUMN]:
+                if elem.bounds:
+                    (min_x, min_y, min_z), (max_x, max_y, max_z) = elem.bounds
+                    # Check if it intersects the focal point Z loosely
+                    if min_z - 2.0 <= cz <= max_z + 2.0:
+                        obstacles.append(box(min_x, min_y, max_x, max_y))
+                        
+        boundary_coords = None
+        radius = 3.0
+        computed_area = radius * radius * 3.14159
+        
+        if obstacles:
+            all_walls = unary_union(obstacles)
+            center = Point(cx, cy)
+            points = []
+            for angle in range(0, 360, 5):
+                rad = math.radians(angle)
+                ray = LineString([center, Point(cx + math.cos(rad)*50, cy + math.sin(rad)*50)])
+                inter = ray.intersection(all_walls)
+                if not inter.is_empty:
+                    closest = None
+                    min_dist = float('inf')
+                    if inter.geom_type == 'Point': closest = inter
+                    elif inter.geom_type == 'MultiPoint': closest = min(inter.geoms, key=lambda p: center.distance(p))
+                    elif inter.geom_type == 'LineString': closest = Point(inter.coords[0])
+                    elif inter.geom_type == 'MultiLineString': closest = min([Point(ls.coords[0]) for ls in inter.geoms], key=lambda p: center.distance(p))
+                    elif inter.geom_type == 'GeometryCollection':
+                        for geom in inter.geoms:
+                            pt = None
+                            if geom.geom_type == 'Point': pt = geom
+                            elif geom.geom_type == 'LineString': pt = Point(geom.coords[0])
+                            if pt and center.distance(pt) < min_dist:
+                                min_dist = center.distance(pt)
+                                closest = pt
+                    
+                    if closest: points.append(closest)
+                else:
+                    # No intersection, just use fixed distance
+                    points.append(Point(cx + math.cos(rad)*10, cy + math.sin(rad)*10))
+                    
+            if len(points) >= 3:
+                poly = Polygon(points)
+                # Simplify polygon to remove tiny jagged edges
+                poly = poly.simplify(0.1)
+                if not poly.is_empty and poly.area > 1.0:
+                    boundary_coords = list(poly.exterior.coords)
+                    # Update focal point and area based on true room polygon
+                    focal_point = (poly.centroid.x, poly.centroid.y, cz)
+                    computed_area = poly.area
+                    radius = math.sqrt(poly.area / math.pi)
+
+        self.statusbar.clearMessage()
+            
+        if not self.current_model.annotations:
+            from core.model_annotations import ModelAnnotations
+            self.current_model.annotations = ModelAnnotations()
+            
+        # Add virtual space
+        v_space = self.current_model.annotations.add_virtual_space(
+            name=name,
+            position=focal_point,
+            level_id=self.visualization.settings.level_filter or "",
+            radius=radius,
+            category=category,
+            boundary=boundary_coords
+        )
+        
+        self.log_message(f"Added virtual space '{name}' at {focal_point} with area {computed_area:.1f}sqm")
+        self._update_virtual_space_list()
+        
+        # Inject into model immediately so it renders and gets processed
+        from core.bim_processor import BIMSpace
+        synthetic_space = BIMSpace(
+            id=v_space.id,
+            global_id=v_space.id,
+            name=v_space.name,
+            long_name=v_space.name,
+            level=v_space.level_id,
+            area=computed_area,
+            volume=0.0,
+            bounds=None,
+            center=v_space.position,
+            geometry={"boundary": boundary_coords} if boundary_coords else None,
+            category=v_space.category,
+            occupancy_capacity=max(1, int(computed_area / 10))
+        )
+        self.current_model.spaces[v_space.id] = synthetic_space
+        
+        # Add a default annotation so it can be edited like a normal space
+        ann = self.current_model.annotations.get_or_create_space(v_space.id)
+        ann.category_override = v_space.category
+        
+        # Refresh visualization
+        self.visualization.refresh()
+
+    def _on_recompute_graph_clicked(self):
+        """Recompute the spatial graph with current annotations."""
+        if not self.current_model:
+            QMessageBox.warning(self, "Warning", "No model loaded")
+            return
+        
+        self.log_message("Recomputing spatial graph with annotations...")
+        self.statusbar.showMessage("Recomputing spatial graph...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        try:
+            self.progress_bar.setValue(30)
+            annotations = self.current_model.annotations
+            spatial_graph = self.spatial_engine.process_model(self.current_model, annotations)
+            self.progress_bar.setValue(80)
+            
+            # Update visualization with new paths
+            self.visualization.spatial_graph = spatial_graph
+            self.visualization.display_exits()
+            if self.visualization.settings.show_evacuation_paths:
+                self.visualization.display_evacuation_paths()
+            
+            self.progress_bar.setValue(100)
+            self.log_message("Spatial graph recomputed successfully", "SUCCESS")
+            
+            # Update path preview if a room is selected
+            if self.currently_selected_space_id:
+                self._update_path_preview(self.currently_selected_space_id)
+            
+        except Exception as e:
+            self.log_message(f"Error recomputing spatial graph: {e}", "ERROR")
+            QMessageBox.critical(self, "Error", f"Recompute failed:\n{str(e)}")
+        finally:
+            self.progress_bar.setVisible(False)
+            self.statusbar.showMessage("Ready")
 
     def _create_properties_panel(self):
         """Create the properties panel."""
@@ -595,6 +1027,20 @@ class MainWindow(QMainWindow):
         self.seed_spin.setValue(42)
         seed_layout.addWidget(self.seed_spin)
         settings_layout.addLayout(seed_layout)
+        
+        # Show trails toggle
+        self.chk_show_trails = QCheckBox("Show Agent Trails")
+        self.chk_show_trails.setChecked(False)
+        self.chk_show_trails.setToolTip("Draw path trace lines behind each agent")
+        self.chk_show_trails.stateChanged.connect(self._on_show_trails_changed)
+        settings_layout.addWidget(self.chk_show_trails)
+        
+        # Show spatial graph toggle
+        self.chk_show_spatial_graph = QCheckBox("Show Spatial Graph")
+        self.chk_show_spatial_graph.setChecked(True)
+        self.chk_show_spatial_graph.setToolTip("Display the generated navigation graph nodes and connections")
+        self.chk_show_spatial_graph.stateChanged.connect(self._on_show_spatial_graph_changed)
+        settings_layout.addWidget(self.chk_show_spatial_graph)
         
         layout.addWidget(settings_group)
         
@@ -762,6 +1208,30 @@ class MainWindow(QMainWindow):
         """Handle wall opacity slider change."""
         self.visualization.settings.wall_opacity = value / 100.0
         self.visualization.refresh()
+
+    def _on_show_trails_changed(self, state):
+        """Handle show trails checkbox toggle."""
+        show = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else bool(state)
+        self.visualization.settings.show_trails = show
+        if not show:
+            # Clear existing trail actors
+            for actor in self.visualization.trail_actors.values():
+                try:
+                    self.visualization.plotter.remove_actor(actor)
+                except Exception:
+                    pass
+            self.visualization.trail_actors.clear()
+            if self.visualization.plotter:
+                try:
+                    self.visualization.plotter.render()
+                except Exception:
+                    pass
+                    
+    def _on_show_spatial_graph_changed(self, state):
+        """Handle show spatial graph checkbox toggle."""
+        show = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else bool(state)
+        self.visualization.settings.show_spatial_graph = show
+        self.visualization.refresh()
     
     def _on_open_ifc(self):
         """Handle open IFC file action."""
@@ -784,17 +1254,28 @@ class MainWindow(QMainWindow):
         
         try:
             # Process IFC
-            self.progress_bar.setValue(30)
-            model = self.bim_processor.load_ifc(file_path)
+            def update_progress(msg, val):
+                self.statusbar.showMessage(msg)
+                self.progress_bar.setValue(val)
+                QApplication.processEvents()
+                
+            model = self.bim_processor.load_ifc(file_path, progress_callback=update_progress)
             self.current_model = model
             
             self.progress_bar.setValue(60)
             
             # Process spatial intelligence
             self.log_message("Processing spatial intelligence...")
-            spatial_graph = self.spatial_engine.process_model(model)
+            annotations = self.current_model.annotations
+            spatial_graph = self.spatial_engine.process_model(self.current_model, annotations)
             
             self.progress_bar.setValue(80)
+            
+            # Update visualization with paths
+            self.visualization.spatial_graph = spatial_graph
+            if self.visualization.settings.show_evacuation_paths:
+                self.visualization.display_evacuation_paths()
+            self.visualization.display_exits()
             
             # Update UI
             self._update_project_tree(model)
@@ -1070,7 +1551,8 @@ Errors: {len(report['errors'])}
         
         try:
             self.progress_bar.setValue(50)
-            spatial_graph = self.spatial_engine.process_model(self.current_model)
+            annotations = self.current_model.annotations
+            spatial_graph = self.spatial_engine.process_model(self.current_model, annotations)
             self.progress_bar.setValue(100)
             
             # Update accessibility info
@@ -1152,7 +1634,8 @@ Connection Types:
                 
             # Clear previous custom room settings on new preset
             self.custom_room_settings.clear()
-            self._on_space_selected(self.currently_selected_space_id)
+            if self.currently_selected_space_id:
+                self._on_space_selected(self.currently_selected_space_id)
                 
             # Initialize simulation
             sim_model = self.simulation_engine.initialize_simulation(

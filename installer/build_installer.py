@@ -116,7 +116,7 @@ def compile_installer():
     setup_files = list(DIST_DIR.glob("BIM-CrowdSim-Setup-*.exe"))
     if setup_files:
         setup_exe = setup_files[0]
-        print(f"\n[OK] Installer created: {setup_exe}")
+        print(f"\n✓ Installer successfully created at {setup_exe}")
         print(f"  Size: {setup_exe.stat().st_size / (1024*1024):.1f} MB")
         return setup_exe
     else:
@@ -146,9 +146,9 @@ def main():
     else:
         exe_path = DIST_DIR / APP_NAME / f"{APP_NAME}.exe"
         if not exe_path.is_file():
-            print(f"✗ No existing build found at {exe_path}. Run without --skip-build.")
+            print(f"X No existing build found at {exe_path}. Run without --skip-build.")
             sys.exit(1)
-        print(f"Reusing existing build: {exe_path}")
+        print(f"✓ Found existing build at {exe_path}")
 
     setup_exe = compile_installer()
 

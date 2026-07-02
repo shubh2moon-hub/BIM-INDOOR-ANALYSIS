@@ -31,6 +31,7 @@ import math
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import deque
 
 import numpy as np
 import mesa
@@ -80,7 +81,6 @@ from engine.journey_system import (
     DirectSteeringStage, BlockedPathStage, StageResult, StageState
 )
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Numerical epsilon to avoid divide-by-zero in direction calculations
@@ -296,9 +296,9 @@ class BIMAgent(Agent):
         self.travel_time = 0.0
         self.waiting_time = 0.0
         self.interactions = 0
-        self.state_history = []
-        self.position_history = []
-        self.speed_history = []
+        self.state_history = deque(maxlen=200)
+        self.position_history = deque(maxlen=200)
+        self.speed_history = deque(maxlen=200)
 
         # Current speed (can vary)
         self.current_speed = profile.base_speed
@@ -509,6 +509,12 @@ class BIMAgent(Agent):
         new_position = self._apply_wall_constraint(new_position)
 
         self.position = new_position
+        # Sync with Mesa's spatial index
+        try:
+            self.model.space.move_agent(self, (float(self.position[0]), float(self.position[1])))
+        except Exception:
+            pass
+        
         self.current_speed = float(np.linalg.norm(self.velocity))
         self.traveled_distance += self.current_speed * self.model.time_step
         self.travel_time += self.model.time_step
@@ -552,15 +558,21 @@ class BIMAgent(Agent):
         """Behavior during evacuation."""
         if not self.destination:
             self._set_evacuation_destination()
+        
         if not self.path:
             self._plan_path()
+            
         if self.path:
             # Move faster during evacuation
             self._movement_params.desired_speed = min(self.profile.max_speed * 1.2, 2.0)
             self._behavior_moving()
-        else:
+        elif self.destination and self._distance_to(self.model.bim_model.spaces[self.destination].center) < 2.0:
+            # Reached destination successfully
             self.state = AgentState.DISABLED
             self.model.evacuated_agents += 1
+        else:
+            # Trapped / No path could be found
+            self.velocity = np.zeros(3)
 
     def _behavior_interacting(self):
         """Behavior when interacting with other agents."""
@@ -592,13 +604,14 @@ class BIMAgent(Agent):
         """Get nearby agents as (position, velocity, params) tuples."""
         neighbors = []
         vision = self._movement_params.radius * 4 + 2.0  # neighbor search radius
-        for agent in self.model._get_all_agents():
-            if agent != self:
-                dist = np.linalg.norm(self.position - agent.position)
-                if dist < vision:
-                    # Use agent's own params if it has them, else default
-                    other_params = getattr(agent, '_movement_params', AgentMovementParams(radius=agent.profile.size))
-                    neighbors.append((agent.position.copy(), agent.velocity.copy(), other_params))
+        # Use Mesa spatial index instead of checking all agents
+        pos_tuple = (float(self.position[0]), float(self.position[1]))
+        nearby_agents = self.model.space.get_neighbors(pos_tuple, vision, include_center=False)
+        for agent in nearby_agents:
+            if hasattr(agent, 'position') and hasattr(agent, 'velocity'):
+                # Use agent's own params if it has them, else default
+                other_params = getattr(agent, '_movement_params', AgentMovementParams(radius=getattr(agent.profile, 'size', 0.4)))
+                neighbors.append((agent.position.copy(), agent.velocity.copy(), other_params))
         return neighbors
 
     def _get_nearby_walls(self) -> List[WallSegment]:
@@ -640,20 +653,37 @@ class BIMAgent(Agent):
 
     def _plan_path(self):
         """Plan path to destination using spatial graph."""
-        if not self.destination or not self.model.spatial_engine:
+        if not self.model.spatial_engine:
             return
         current_space = self.current_space
         if not current_space:
             return
-        path = self.model.spatial_engine.find_shortest_path(current_space, self.destination)
+            
+        path = None
+        
+        # If evacuating, prioritize the precomputed evacuation paths (which go to the exterior exits)
+        if hasattr(self.model.spatial_engine, "get_evacuation_path"):
+            path = self.model.spatial_engine.get_evacuation_path(current_space)
+            
+        # Fallback to standard pathfinding if no evacuation path exists (e.g. standard navigation)
+        if not path and self.destination:
+            path_nodes = self.model.spatial_engine.find_shortest_path(current_space, self.destination)
+            if path_nodes:
+                path = [n.replace("space_", "") for n in path_nodes]
+                
         if path:
             self.path = []
-            for node_id in path[1:]:
-                space_id = node_id.replace("space_", "")
+            for space_id in path[1:]:  # Skip current space
                 if space_id in self.model.bim_model.spaces:
                     space = self.model.bim_model.spaces[space_id]
                     if space.center:
                         self.path.append(space.center)
+                elif space_id.startswith("exit_"):
+                    # For virtual exit nodes, fetch their position from the spatial graph
+                    if space_id in self.model.spatial_engine.spatial_graph.nodes:
+                        exit_node = self.model.spatial_engine.spatial_graph.nodes[space_id]
+                        if exit_node.center:
+                            self.path.append(exit_node.center)
 
     def _set_evacuation_destination(self):
         """Set nearest exit as destination during evacuation."""
@@ -663,6 +693,13 @@ class BIMAgent(Agent):
             s for s in self.model.bim_model.spaces.values()
             if s.category in ["entrance", "exit", "lobby", "public"]
         ]
+        if not exits:
+            # Fallback if no specific exits exist
+            exits = [
+                s for s in self.model.bim_model.spaces.values()
+                if s.category in ["corridor", "staircase", "space"]
+            ]
+            
         if exits:
             closest = min(exits, key=lambda e: self._distance_to(e.center))
             self.destination = closest.id
@@ -671,6 +708,16 @@ class BIMAgent(Agent):
         """Update which space the agent is currently in."""
         if not self.model.bim_model:
             return
+            
+        # Fast path: O(1) check if still within current space bounds
+        if self.current_space:
+            current = self.model.bim_model.spaces.get(self.current_space)
+            if current and current.bounds:
+                (min_x, min_y, min_z), (max_x, max_y, max_z) = current.bounds
+                if min_x <= self.position[0] <= max_x and min_y <= self.position[1] <= max_y:
+                    return
+                    
+        # Slow path: O(M) fallback if moved outside bounds or initial lookup
         closest_space = None
         closest_dist = float('inf')
         for space in self.model.bim_model.spaces.values():
@@ -690,13 +737,10 @@ class BIMAgent(Agent):
 
     def _count_nearby_agents(self, radius: float) -> int:
         """Count agents within radius."""
-        count = 0
-        for agent in self.model._get_all_agents():
-            if agent != self:
-                dist = np.linalg.norm(self.position - agent.position)
-                if dist < radius:
-                    count += 1
-        return count
+        # Use Mesa spatial index instead of checking all agents
+        pos_tuple = (float(self.position[0]), float(self.position[1]))
+        nearby_agents = self.model.space.get_neighbors(pos_tuple, radius, include_center=False)
+        return len(nearby_agents)
 
     def get_metrics(self) -> Dict:
         """Get agent metrics."""
@@ -790,11 +834,11 @@ class BIMSimulationModel(Model):
         self.datacollector = DataCollector(
             model_reporters={
                 "Agent Count": lambda m: len(m._get_all_agents()),
-                "Moving": self._count_moving_agents,
-                "Waiting": self._count_waiting_agents,
+                "Moving": lambda m: sum(1 for a in m._get_all_agents() if a.state == AgentState.MOVING),
+                "Waiting": lambda m: sum(1 for a in m._get_all_agents() if a.state == AgentState.WAITING),
                 "Evacuated": lambda m: m.evacuated_agents,
-                "Queuing": self._count_queuing_agents,
-                "Avg Speed": self._get_avg_speed,
+                "Queuing": lambda m: sum(1 for a in m._get_all_agents() if a.state == AgentState.QUEUING),
+                "Avg Speed": lambda m: (sum(a.current_speed for a in m._get_all_agents()) / len(m._get_all_agents())) if m._get_all_agents() else 0,
                 # NEW v1.3.0
                 "Incapacitated": lambda m: sum(1 for a in m._get_all_agents() if a.is_incapacitated),
                 "Max FED": lambda m: max((a.fed for a in m._get_all_agents()), default=0.0),
@@ -984,14 +1028,16 @@ class BIMSimulationModel(Model):
                     offset_x = random.uniform(-1, 1)
                     offset_y = random.uniform(-1, 1)
                     
-                    if hasattr(space, "bounds") and space.bounds and len(space.bounds) >= 4:
-                        # Assuming bounds: (min_x, max_x, min_y, max_y, ...)
-                        min_x, max_x, min_y, max_y = space.bounds[0:4]
-                        width = max_x - min_x
-                        height = max_y - min_y
-                        if width > 0 and height > 0:
-                            offset_x = random.uniform(-width/4, width/4)
-                            offset_y = random.uniform(-height/4, height/4)
+                    if hasattr(space, "bounds") and space.bounds and len(space.bounds) == 2:
+                        try:
+                            (min_x, min_y, min_z), (max_x, max_y, max_z) = space.bounds
+                            width = max_x - min_x
+                            height = max_y - min_y
+                            if width > 0 and height > 0:
+                                offset_x = random.uniform(-width/4, width/4)
+                                offset_y = random.uniform(-height/4, height/4)
+                        except (ValueError, TypeError):
+                            pass
                     
                     agent.position = np.array([
                         space.center[0] + offset_x,
@@ -1003,8 +1049,9 @@ class BIMSimulationModel(Model):
         self.schedule.add(agent)
         self._agent_registry[agent_id] = agent
 
+        # Sync with Mesa space (using strict tuples to avoid object array fallback in Mesa)
         try:
-            self.space.place_agent(agent, (agent.position[0], agent.position[1]))
+            self.space.place_agent(agent, (float(agent.position[0]), float(agent.position[1])))
         except Exception:
             pass
 

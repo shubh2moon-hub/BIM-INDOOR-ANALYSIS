@@ -17,7 +17,6 @@ from shapely.ops import unary_union
 
 from core.bim_processor import BIMModel, BIMSpace, BIMElement, ElementCategory
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +68,9 @@ class SpatialGraph:
     network: nx.Graph = field(default_factory=nx.Graph)
     nav_network: nx.Graph = field(default_factory=nx.Graph)
     level_graphs: Dict[str, nx.Graph] = field(default_factory=dict)
+    # NEW: precomputed evacuation paths (space_id -> list of space_ids)
+    evacuation_paths: Dict[str, List[str]] = field(default_factory=dict)
+    exit_nodes: List[str] = field(default_factory=list)  # space node IDs that are exits
 
 
 class SpatialIntelligenceEngine:
@@ -78,8 +80,13 @@ class SpatialIntelligenceEngine:
         self.spatial_graph: Optional[SpatialGraph] = None
         self.current_model: Optional[BIMModel] = None
 
-    def process_model(self, model: BIMModel) -> SpatialGraph:
-        """Process a BIM model and generate spatial intelligence."""
+    def process_model(self, model: BIMModel, annotations=None) -> SpatialGraph:
+        """Process a BIM model and generate spatial intelligence.
+        
+        Args:
+            model: The BIM model to process.
+            annotations: Optional ModelAnnotations with user overrides.
+        """
         logger.info("Starting spatial intelligence processing...")
         self.current_model = model
 
@@ -87,47 +94,65 @@ class SpatialIntelligenceEngine:
             id=str(uuid.uuid4()),
             name=f"Spatial Graph - {model.name}"
         )
+            
+        self.spatial_graph = graph
 
-        # Step 1: Create space nodes
+        # Step 1: Create space nodes (with category overrides from annotations)
         logger.info("Creating space nodes...")
-        self._create_space_nodes(model, graph)
+        self._create_space_nodes(model, graph, annotations)
 
         # Step 2: Detect connectivity between spaces
         logger.info("Detecting space connectivity...")
-        self._detect_connectivity(model, graph)
+        self._detect_connectivity(model, graph, annotations)
 
         # Step 3: Build navigation network
         logger.info("Building navigation network...")
-        self._build_navigation_network(model, graph)
+        self._build_navigation_network(model, graph, annotations)
 
         # Step 4: Create NetworkX graph
         logger.info("Creating NetworkX graphs...")
-        self._create_networkx_graphs(graph)
+        self._create_networkx_graphs(graph, annotations)
 
         # Step 5: Analyze spatial properties
         logger.info("Analyzing spatial properties...")
         self._analyze_spatial_properties(graph)
 
+        # Step 6: Compute evacuation paths
+        logger.info("Computing evacuation paths...")
+        self._compute_evacuation_paths(graph, annotations)
+
         self.spatial_graph = graph
         model.spatial_graph = graph
 
-        logger.info(f"Spatial processing complete: {len(graph.nodes)} spaces, {len(graph.connections)} connections")
+        logger.info(f"Spatial processing complete: {len(graph.nodes)} spaces, {len(graph.connections)} connections, {len(graph.evacuation_paths)} evacuation paths")
         return graph
 
-    def _create_space_nodes(self, model: BIMModel, graph: SpatialGraph):
+    def _create_space_nodes(self, model: BIMModel, graph: SpatialGraph, annotations=None):
         """Create nodes for each space in the building."""
         for space_id, space in model.spaces.items():
+            # Determine effective category (annotation overrides IFC default)
+            category = space.category
+            custom_name = space.name
+            is_exit = False
+            if annotations and space_id in annotations.space_annotations:
+                ann = annotations.space_annotations[space_id]
+                if ann.category_override:
+                    category = ann.category_override
+                if ann.custom_name:
+                    custom_name = ann.custom_name
+                is_exit = ann.is_exit
+
             # Estimate capacity based on area (1 person per 10 sqm default)
             capacity = int(space.area / 10) if space.area > 0 else 5
 
             # Determine if space is navigable
-            navigable = space.category not in ["wall", "void"]
+            navigable = category not in ["wall", "void", "exterior"]
 
             node = SpaceNode(
                 id=f"space_{space_id}",
                 space_id=space_id,
-                name=space.name,
-                category=space.category,
+                name=custom_name,
+                category=category,
                 level=space.level,
                 center=space.center or (0, 0, 0),
                 area=space.area,
@@ -135,18 +160,20 @@ class SpatialIntelligenceEngine:
                 attributes={
                     "navigable": navigable,
                     "volume": space.volume,
-                    "long_name": space.long_name
+                    "long_name": space.long_name,
+                    "is_exit": is_exit,
                 }
             )
             graph.nodes[node.id] = node
 
-        # Add corridor/hallway nodes if not already spaces
-        for elem_id, elem in model.elements.items():
-            if elem.category in [ElementCategory.DOOR, ElementCategory.STAIR, ElementCategory.ELEVATOR]:
-                # These will be handled as connections
-                pass
+            # Track exit nodes
+            if is_exit or category in ["exit", "entrance", "lobby"]:
+                if node.id not in graph.exit_nodes:
+                    graph.exit_nodes.append(node.id)
 
-    def _detect_connectivity(self, model: BIMModel, graph: SpatialGraph):
+        logger.info(f"  Created {len(graph.nodes)} space nodes, {len(graph.exit_nodes)} marked as exits")
+
+    def _detect_connectivity(self, model: BIMModel, graph: SpatialGraph, annotations=None):
         """Detect connectivity between spaces using doors, corridors, and stairs."""
         # Method 1: Door-based connectivity
         self._detect_door_connectivity(model, graph)
@@ -160,6 +187,9 @@ class SpatialIntelligenceEngine:
         # Method 4: Corridor-based connectivity
         self._detect_corridor_connectivity(model, graph)
 
+        # NEW: Method 5: Virtual connections from annotations (missing doors)
+        self._add_virtual_connections(graph, annotations)
+
     def _detect_door_connectivity(self, model: BIMModel, graph: SpatialGraph):
         """Detect connections through doors."""
         doors = [e for e in model.elements.values() if e.category == ElementCategory.DOOR]
@@ -168,7 +198,43 @@ class SpatialIntelligenceEngine:
             # Find spaces adjacent to this door
             adjacent_spaces = self._find_adjacent_spaces_to_door(model, door)
 
-            if len(adjacent_spaces) >= 2:
+            if len(adjacent_spaces) == 1:
+                # Exterior door (only connects to 1 space).
+                # Only treat it as an EXIT if it opens from a corridor.
+                space = adjacent_spaces[0]
+                if space.category == "corridor":
+                    exit_id = f"exit_{door.id}"
+                    
+                    # Add virtual exit spatial node
+                    graph.nodes[exit_id] = SpaceNode(
+                        id=exit_id,
+                        space_id=exit_id,
+                        name=f"{door.name} (Exterior Exit)",
+                        category="exit",
+                        level=door.level,
+                        center=door.center or (0,0,0),
+                        area=5.0,
+                        capacity=100
+                    )
+                    graph.exit_nodes.append(exit_id)
+                    
+                    # Add connection
+                    connection = Connection(
+                        id=f"conn_{door.id}_exit",
+                        source_id=f"space_{space.id}",
+                        target_id=exit_id,
+                        connection_type="door",
+                        weight=1.0,
+                        width=door.properties.get("Width", 1.0),
+                        attributes={
+                            "door_id": door.id,
+                            "door_name": door.name,
+                            "is_exterior": True
+                        }
+                    )
+                    graph.connections[connection.id] = connection
+
+            elif len(adjacent_spaces) >= 2:
                 # Create connections between all pairs of adjacent spaces
                 for i in range(len(adjacent_spaces)):
                     for j in range(i + 1, len(adjacent_spaces)):
@@ -196,140 +262,29 @@ class SpatialIntelligenceEngine:
                         )
                         graph.connections[connection.id] = connection
 
-    def _find_adjacent_spaces_to_door(self, model: BIMModel, door: BIMElement) -> List[BIMSpace]:
-        """Find spaces adjacent to a door element."""
-        adjacent = []
-        door_center = door.center or (0, 0, 0)
-
-        # Find spaces on the same level that are close to the door
-        for space in model.spaces.values():
-            if space.level != door.level:
+    def _add_virtual_connections(self, graph: SpatialGraph, annotations=None):
+        """Add user-defined virtual connections (e.g. missing doors)."""
+        if not annotations or not annotations.virtual_connections:
+            return
+        for conn in annotations.virtual_connections:
+            source_id = f"space_{conn.source_space_id}"
+            target_id = f"space_{conn.target_space_id}"
+            if source_id not in graph.nodes or target_id not in graph.nodes:
+                logger.warning(f"Virtual connection references unknown space(s): {conn.source_space_id} -> {conn.target_space_id}")
                 continue
-            space_center = space.center or (0, 0, 0)
-            dist = self._distance_between(door_center, space_center)
+            connection = Connection(
+                id=f"conn_virt_{conn.id}",
+                source_id=source_id,
+                target_id=target_id,
+                connection_type=conn.connection_type,
+                weight=1.0,
+                width=conn.width,
+                attributes={"virtual": True, "connection_id": conn.id}
+            )
+            graph.connections[connection.id] = connection
+            logger.info(f"  Added virtual connection: {conn.source_space_id} -> {conn.target_space_id}")
 
-            # If door is within reasonable distance of space center, consider adjacent
-            # This is a heuristic - in real IFC, we'd use IfcRelSpaceBoundary
-            if dist < 15.0:  # Within 15 meters
-                adjacent.append(space)
-
-        return adjacent
-
-    def _detect_proximity_connectivity(self, model: BIMModel, graph: SpatialGraph):
-        """Detect connections based on spatial proximity."""
-        spaces = list(model.spaces.values())
-        threshold = 20.0  # Maximum distance for proximity connection
-
-        for i in range(len(spaces)):
-            for j in range(i + 1, len(spaces)):
-                space_a = spaces[i]
-                space_b = spaces[j]
-
-                # Only connect spaces on same level
-                if space_a.level != space_b.level:
-                    continue
-
-                # Skip if already connected by door
-                already_connected = any(
-                    (c.source_id == f"space_{space_a.id}" and c.target_id == f"space_{space_b.id}") or
-                    (c.source_id == f"space_{space_b.id}" and c.target_id == f"space_{space_a.id}")
-                    for c in graph.connections.values()
-                )
-                if already_connected:
-                    continue
-
-                center_a = space_a.center or (0, 0, 0)
-                center_b = space_b.center or (0, 0, 0)
-                dist = self._distance_between(center_a, center_b)
-
-                if dist < threshold and space_a.category == "corridor" or space_b.category == "corridor":
-                    connection = Connection(
-                        id=f"conn_prox_{space_a.id}_{space_b.id}",
-                        source_id=f"space_{space_a.id}",
-                        target_id=f"space_{space_b.id}",
-                        connection_type="open",
-                        weight=dist,
-                        attributes={"connection_method": "proximity"}
-                    )
-                    graph.connections[connection.id] = connection
-
-    def _detect_vertical_connectivity(self, model: BIMModel, graph: SpatialGraph):
-        """Detect vertical connections through stairs and elevators."""
-        # Find stair elements
-        stairs = [e for e in model.elements.values() if e.category == ElementCategory.STAIR]
-        elevators = [e for e in model.elements.values() if "elevator" in e.name.lower() or "lift" in e.name.lower()]
-
-        vertical_elements = stairs + elevators
-
-        for vert_elem in vertical_elements:
-            elem_type = "stair" if vert_elem.category == ElementCategory.STAIR else "elevator"
-
-            # Find spaces at different levels that are near this vertical element
-            vert_center = vert_elem.center or (0, 0, 0)
-
-            for space_a in model.spaces.values():
-                center_a = space_a.center or (0, 0, 0)
-                dist_a = ((center_a[0] - vert_center[0]) ** 2 + (center_a[1] - vert_center[1]) ** 2) ** 0.5
-
-                if dist_a < 10.0:  # Within 10m horizontally
-                    for space_b in model.spaces.values():
-                        if space_b.level == space_a.level:
-                            continue
-
-                        center_b = space_b.center or (0, 0, 0)
-                        dist_b = ((center_b[0] - vert_center[0]) ** 2 + (center_b[1] - vert_center[1]) ** 2) ** 0.5
-
-                        if dist_b < 10.0:
-                            # These spaces are connected through this vertical element
-                            connection = Connection(
-                                id=f"conn_vert_{vert_elem.id}_{space_a.id}_{space_b.id}",
-                                source_id=f"space_{space_a.id}",
-                                target_id=f"space_{space_b.id}",
-                                connection_type=elem_type,
-                                weight=abs(center_a[2] - center_b[2]),
-                                attributes={
-                                    "vertical_element_id": vert_elem.id,
-                                    "levels": [space_a.level, space_b.level]
-                                }
-                            )
-                            graph.connections[connection.id] = connection
-
-    def _detect_corridor_connectivity(self, model: BIMModel, graph: SpatialGraph):
-        """Connect rooms to adjacent corridors."""
-        corridors = [s for s in model.spaces.values() if s.category == "corridor"]
-        rooms = [s for s in model.spaces.values() if s.category not in ["corridor", "staircase", "elevator", "void"]]
-
-        for room in rooms:
-            room_center = room.center or (0, 0, 0)
-
-            for corridor in corridors:
-                if corridor.level != room.level:
-                    continue
-
-                corridor_center = corridor.center or (0, 0, 0)
-                dist = self._distance_between(room_center, corridor_center)
-
-                # If room is close to corridor, they're likely connected
-                if dist < 12.0:
-                    # Check if not already connected
-                    already_connected = any(
-                        ((c.source_id == f"space_{room.id}" and c.target_id == f"space_{corridor.id}") or
-                         (c.source_id == f"space_{corridor.id}" and c.target_id == f"space_{room.id}"))
-                        for c in graph.connections.values()
-                    )
-
-                    if not already_connected:
-                        connection = Connection(
-                            id=f"conn_corr_{room.id}_{corridor.id}",
-                            source_id=f"space_{room.id}",
-                            target_id=f"space_{corridor.id}",
-                            connection_type="corridor",
-                            weight=dist,
-                            attributes={"connection_method": "corridor_access"}
-                        )
-                        graph.connections[connection.id] = connection
-
-    def _build_navigation_network(self, model: BIMModel, graph: SpatialGraph):
+    def _build_navigation_network(self, model: BIMModel, graph: SpatialGraph, annotations=None):
         """Build a detailed navigation network with waypoints."""
         # Create navigation nodes at space centers
         for node_id, space_node in graph.nodes.items():
@@ -365,36 +320,53 @@ class SpatialIntelligenceEngine:
                 )
                 graph.navigation_nodes[nav_node.id] = nav_node
 
+        # NEW: Create navigation nodes for virtual exits
+        if annotations:
+            for v_exit in annotations.exits:
+                nav_node = NavigationNode(
+                    id=f"nav_exit_{v_exit.id}",
+                    position=v_exit.position,
+                    space_id="",
+                    node_type="exit"
+                )
+                graph.navigation_nodes[nav_node.id] = nav_node
+                # Connect to nearby spaces on same level
+                for space_id, space in model.spaces.items():
+                    if space.center and space.level == v_exit.level_id:
+                        dist = self._distance_between(space.center, v_exit.position)
+                        # Ensure exit connects back to the space
+                        if dist < 15.0:
+                            conn_id = f"conn_exit_{v_exit.id}_{space_id}"
+                            graph.connections[conn_id] = Connection(
+                                id=conn_id,
+                                source_id=f"space_{space_id}",
+                                target_id="__exit__",
+                                connection_type="exit",
+                                weight=dist,
+                                width=v_exit.width,
+                                accessible=v_exit.accessible,
+                                attributes={"virtual_exit_id": v_exit.id, "position": list(v_exit.position)}
+                            )
+                            # Add exit to exit_nodes if not already there
+                            sid = f"space_{space_id}"
+                            if sid not in graph.exit_nodes:
+                                graph.exit_nodes.append(sid)
+
         # Connect navigation nodes
         self._connect_navigation_nodes(graph)
 
-    def _connect_navigation_nodes(self, graph: SpatialGraph):
-        """Create connections between navigation nodes."""
-        nav_nodes = list(graph.navigation_nodes.values())
-
-        for i, node_a in enumerate(nav_nodes):
-            for node_b in nav_nodes[i + 1:]:
-                # Connect nodes in the same space
-                if node_a.space_id and node_a.space_id == node_b.space_id:
-                    dist = self._distance_between(node_a.position, node_b.position)
-                    if dist > 0:
-                        node_a.connections.append(node_b.id)
-                        node_b.connections.append(node_a.id)
-
-                # Connect nearby waypoints
-                elif node_a.node_type == "waypoint" and node_b.node_type == "waypoint":
-                    dist = self._distance_between(node_a.position, node_b.position)
-                    if dist < 15.0:
-                        node_a.connections.append(node_b.id)
-                        node_b.connections.append(node_a.id)
-
-    def _create_networkx_graphs(self, graph: SpatialGraph):
+    def _create_networkx_graphs(self, graph: SpatialGraph, annotations=None):
         """Create NetworkX graphs for pathfinding."""
         # Main space graph
         G = nx.Graph()
 
         # Add nodes
         for node_id, space_node in graph.nodes.items():
+            # Check if blocked by annotation
+            blocked = False
+            if annotations and space_node.space_id in annotations.space_annotations:
+                blocked = annotations.space_annotations[space_node.space_id].block_path
+
             G.add_node(
                 node_id,
                 name=space_node.name,
@@ -402,11 +374,17 @@ class SpatialIntelligenceEngine:
                 level=space_node.level,
                 center=space_node.center,
                 area=space_node.area,
-                capacity=space_node.capacity
+                capacity=space_node.capacity,
+                blocked=blocked,
             )
 
         # Add edges
         for conn_id, conn in graph.connections.items():
+            # Skip edges involving blocked nodes
+            if G.has_node(conn.source_id) and G.nodes[conn.source_id].get("blocked", False):
+                continue
+            if G.has_node(conn.target_id) and G.nodes[conn.target_id].get("blocked", False):
+                continue
             G.add_edge(
                 conn.source_id,
                 conn.target_id,
@@ -466,6 +444,171 @@ class SpatialIntelligenceEngine:
 
         graph.nav_network = nav_G
 
+    def _find_adjacent_spaces_to_door(self, model: BIMModel, door: BIMElement) -> List[BIMSpace]:
+        """Find spaces adjacent to a door element."""
+        adjacent = []
+        door_center = door.center or (0, 0, 0)
+
+        # Find spaces on the same level that are close to the door
+        for space in model.spaces.values():
+            if space.level != door.level:
+                continue
+            space_center = space.center or (0, 0, 0)
+            dist = self._distance_between(door_center, space_center)
+
+            # If door is within reasonable distance of space center, consider adjacent
+            # Threshold kept tight so it only picks up actual adjacent spaces
+            if dist < 5.0:
+                adjacent.append(space)
+
+        return adjacent
+
+    def _detect_proximity_connectivity(self, model: BIMModel, graph: SpatialGraph):
+        """Detect connections based on spatial proximity."""
+        spaces = list(model.spaces.values())
+        threshold = 30.0  # Increased maximum distance for proximity connection
+
+        # Build set of existing connections for O(1) lookup
+        existing = set()
+        for c in graph.connections.values():
+            existing.add((c.source_id, c.target_id))
+            existing.add((c.target_id, c.source_id))
+
+        for i in range(len(spaces)):
+            for j in range(i + 1, len(spaces)):
+                space_a = spaces[i]
+                space_b = spaces[j]
+
+                # Only connect spaces on same level
+                if space_a.level != space_b.level:
+                    continue
+
+                # Skip if already connected (O(1) set check)
+                key = (f"space_{space_a.id}", f"space_{space_b.id}")
+                if key in existing:
+                    continue
+
+                center_a = space_a.center or (0, 0, 0)
+                center_b = space_b.center or (0, 0, 0)
+                dist = ((center_a[0] - center_b[0]) ** 2 + (center_a[1] - center_b[1]) ** 2) ** 0.5
+
+                # Use a huge threshold if one is a corridor to catch far centroids
+                threshold = 30.0 if (space_a.category == "corridor" or space_b.category == "corridor") else 5.0
+                
+                if dist < threshold:
+                    connection = Connection(
+                        id=f"conn_prox_{space_a.id}_{space_b.id}",
+                        source_id=f"space_{space_a.id}",
+                        target_id=f"space_{space_b.id}",
+                        connection_type="open",
+                        weight=dist,
+                        attributes={"connection_method": "proximity"}
+                    )
+                    graph.connections[connection.id] = connection
+                    existing.add(key)
+                    existing.add((key[1], key[0]))
+
+    def _detect_vertical_connectivity(self, model: BIMModel, graph: SpatialGraph):
+        """Detect vertical connections through stairs and elevators."""
+        # Find stair elements
+        stairs = [e for e in model.elements.values() if e.category == ElementCategory.STAIR]
+        elevators = [e for e in model.elements.values() if "elevator" in e.name.lower() or "lift" in e.name.lower()]
+
+        vertical_elements = stairs + elevators
+
+        for vert_elem in vertical_elements:
+            elem_type = "stair" if vert_elem.category == ElementCategory.STAIR else "elevator"
+
+            # Find spaces at different levels that are near this vertical element
+            vert_center = vert_elem.center or (0, 0, 0)
+
+            # First pass: collect nearby spaces grouped by level (O(S) instead of O(S²))
+            nearby_by_level = defaultdict(list)
+            for space in model.spaces.values():
+                center = space.center or (0, 0, 0)
+                dist = ((center[0] - vert_center[0]) ** 2 + (center[1] - vert_center[1]) ** 2) ** 0.5
+                # Huge margin of error for stair connectivity (50m) to catch long corridors
+                if dist < 50.0:
+                    nearby_by_level[space.level].append(space)
+
+            # Second pass: connect spaces across different levels
+            levels = list(nearby_by_level.keys())
+            for li in range(len(levels)):
+                for lj in range(li + 1, len(levels)):
+                    for space_a in nearby_by_level[levels[li]]:
+                        center_a = space_a.center or (0, 0, 0)
+                        for space_b in nearby_by_level[levels[lj]]:
+                            center_b = space_b.center or (0, 0, 0)
+                            connection = Connection(
+                                id=f"conn_vert_{vert_elem.id}_{space_a.id}_{space_b.id}",
+                                source_id=f"space_{space_a.id}",
+                                target_id=f"space_{space_b.id}",
+                                connection_type=elem_type,
+                                weight=abs(center_a[2] - center_b[2]),
+                                attributes={
+                                    "vertical_element_id": vert_elem.id,
+                                    "levels": [space_a.level, space_b.level]
+                                }
+                            )
+                            graph.connections[connection.id] = connection
+
+    def _detect_corridor_connectivity(self, model: BIMModel, graph: SpatialGraph):
+        """Connect rooms to adjacent corridors."""
+        corridors = [s for s in model.spaces.values() if s.category == "corridor"]
+        rooms = [s for s in model.spaces.values() if s.category not in ["corridor", "staircase", "elevator", "void"]]
+
+        # Build set of existing connections for O(1) lookup
+        existing = set()
+        for c in graph.connections.values():
+            existing.add((c.source_id, c.target_id))
+            existing.add((c.target_id, c.source_id))
+
+        for room in rooms:
+            room_center = room.center or (0, 0, 0)
+
+            for corridor in corridors:
+                if corridor.level != room.level:
+                    continue
+
+                corridor_center = corridor.center or (0, 0, 0)
+                dist = ((room_center[0] - corridor_center[0]) ** 2 + (room_center[1] - corridor_center[1]) ** 2) ** 0.5
+                
+                # Margin of error for room-to-corridor connections (40m)
+                if dist < 40.0:
+                    key = (f"space_{room.id}", f"space_{corridor.id}")
+                    if key not in existing:
+                        connection = Connection(
+                            id=f"conn_corr_{room.id}_{corridor.id}",
+                            source_id=f"space_{room.id}",
+                            target_id=f"space_{corridor.id}",
+                            connection_type="corridor",
+                            weight=dist,
+                            attributes={"connection_method": "corridor_access"}
+                        )
+                        graph.connections[connection.id] = connection
+                        existing.add(key)
+                        existing.add((key[1], key[0]))
+
+    def _connect_navigation_nodes(self, graph: SpatialGraph):
+        """Create connections between navigation nodes."""
+        nav_nodes = list(graph.navigation_nodes.values())
+
+        for i, node_a in enumerate(nav_nodes):
+            for node_b in nav_nodes[i + 1:]:
+                # Connect nodes in the same space
+                if node_a.space_id and node_a.space_id == node_b.space_id:
+                    dist = self._distance_between(node_a.position, node_b.position)
+                    if dist > 0:
+                        node_a.connections.append(node_b.id)
+                        node_b.connections.append(node_a.id)
+
+                # Connect nearby waypoints
+                elif node_a.node_type == "waypoint" and node_b.node_type == "waypoint":
+                    dist = self._distance_between(node_a.position, node_b.position)
+                    if dist < 15.0:
+                        node_a.connections.append(node_b.id)
+                        node_b.connections.append(node_a.id)
+
     def _analyze_spatial_properties(self, graph: SpatialGraph):
         """Calculate spatial analysis metrics."""
         if not graph.network:
@@ -508,6 +651,62 @@ class SpatialIntelligenceEngine:
                     graph.nodes[node_id].attributes["clustering_coefficient"] = value
         except Exception:
             pass
+
+    def _compute_evacuation_paths(self, graph: SpatialGraph, annotations=None):
+        """Compute shortest path from every navigable space to the nearest exit."""
+        graph.evacuation_paths.clear()
+
+        if not graph.network or not graph.exit_nodes:
+            logger.warning("No network or exit nodes available for evacuation path computation")
+            return
+
+        # Build a set of valid exit node IDs in the network
+        valid_exit_nodes = [n for n in graph.exit_nodes if n in graph.network]
+        if not valid_exit_nodes:
+            logger.warning("No valid exit nodes found in the network")
+            return
+
+        for node_id in graph.nodes:
+            if node_id not in graph.network:
+                continue
+            # Skip non-navigable or blocked
+            if graph.nodes[node_id].attributes.get("navigable", True) is False:
+                continue
+            if graph.network.nodes[node_id].get("blocked", False):
+                continue
+
+            # Find shortest path to nearest exit
+            best_path = None
+            best_length = float('inf')
+            for exit_node in valid_exit_nodes:
+                if exit_node == node_id:
+                    best_path = [node_id]
+                    best_length = 0
+                    break
+                try:
+                    path = nx.shortest_path(graph.network, source=node_id, target=exit_node, weight="weight")
+                    length = nx.shortest_path_length(graph.network, source=node_id, target=exit_node, weight="weight")
+                    if length < best_length:
+                        best_length = length
+                        best_path = path
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+
+            if best_path:
+                graph.evacuation_paths[node_id] = best_path
+
+        logger.info(f"  Computed {len(graph.evacuation_paths)} evacuation paths")
+
+    def get_evacuation_path(self, space_id: str) -> Optional[List[str]]:
+        """Return the precomputed evacuation path for a space (space IDs, not node IDs)."""
+        if not self.spatial_graph:
+            return None
+        node_id = f"space_{space_id}"
+        path = self.spatial_graph.evacuation_paths.get(node_id)
+        if path:
+            # Strip "space_" prefix from each node ID
+            return [n.replace("space_", "") for n in path]
+        return None
 
     def find_shortest_path(self, source_space_id: str, target_space_id: str) -> Optional[List[str]]:
         """Find shortest path between two spaces."""

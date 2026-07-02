@@ -5,7 +5,7 @@
 ; ---------------------------------------------------------------------------
 
 #define MyAppName      "BIM-CrowdSim"
-#define MyAppVersion   "1.2.0"
+#define MyAppVersion   "1.3.0"
 #define MyAppPublisher "BIM-CrowdSim Team"
 #define MyAppURL       "https://github.com/bim-crowdsim"
 #define MyAppExeName   "BIM-CrowdSim.exe"

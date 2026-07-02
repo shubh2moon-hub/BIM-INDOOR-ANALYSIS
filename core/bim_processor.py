@@ -6,6 +6,7 @@ Handles IFC file import, validation, and element extraction.
 import os
 import uuid
 import logging
+import multiprocessing
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,9 +17,11 @@ import ifcopenshell.geom
 import ifcopenshell.util
 import ifcopenshell.util.element
 import ifcopenshell.util.shape
+import ifcopenshell.util.placement
 from ifcopenshell import entity_instance
 
-logging.basicConfig(level=logging.INFO)
+from core.model_annotations import ModelAnnotations
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +105,7 @@ class BIMModel:
     project_info: Dict[str, str] = field(default_factory=dict)
     validation_report: Dict = field(default_factory=dict)
     spatial_graph: Optional[Any] = None
+    annotations: Any = field(default=None)  # ModelAnnotations, imported lazily to avoid circular refs
 
 
 class BIMProcessor:
@@ -111,14 +115,24 @@ class BIMProcessor:
         self.current_model: Optional[BIMModel] = None
         self.settings = ifcopenshell.geom.settings()
         self.settings.set(self.settings.USE_WORLD_COORDS, True)
+        self._has_occ = False
         try:
             self.settings.set(self.settings.USE_PYTHON_OPENCASCADE, True)
+            self._has_occ = True
         except AttributeError:
             logger.warning("Python OpenCASCADE not installed. Falling back to default geometry engine.")
+            try:
+                self.settings.set(self.settings.DISABLE_OPENING_SUBTRACTIONS, True)
+                self.settings.set(self.settings.DISABLE_BOOLEAN_RESULT, True)
+            except AttributeError:
+                pass
 
-    def load_ifc(self, file_path: str) -> BIMModel:
+    def load_ifc(self, file_path: str, progress_callback=None) -> BIMModel:
         """Load and process an IFC file."""
         logger.info(f"Loading IFC file: {file_path}")
+
+        if progress_callback:
+            progress_callback("Loading IFC file...", 5)
 
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"IFC file not found: {file_path}")
@@ -137,20 +151,53 @@ class BIMProcessor:
             schema=ifc_file.schema
         )
 
+        # Initialize empty annotations so the UI can attach overrides immediately
+        try:
+            model.annotations = ModelAnnotations()
+        except Exception:
+            model.annotations = None
+
         # Extract project info
+        logger.info("Extracting project metadata...")
         model.project_info = self._extract_project_info(ifc_file, project)
+        
+        # Pre-compute geometry for all elements
+        logger.info("Pre-computing geometry skipped. Using element-by-element fallback to avoid Windows hangs.")
+        self._geometry_cache = {}
+        # Geometry will be extracted dynamically via self._get_element_geometry_and_bounds()
 
         # Extract levels
         logger.info("Extracting building levels...")
+        if progress_callback: progress_callback("Extracting building levels...", 15)
         model.levels = self._extract_levels(ifc_file)
 
         # Extract spaces
         logger.info("Extracting spaces...")
-        model.spaces = self._extract_spaces(ifc_file, model.levels)
+        if progress_callback: progress_callback("Extracting spaces...", 20)
+        model.spaces = self._extract_spaces(ifc_file, model.levels, progress_callback)
 
         # Extract building elements
         logger.info("Extracting building elements...")
-        model.elements = self._extract_elements(ifc_file, model.levels)
+        if progress_callback: progress_callback("Extracting building elements...", 40)
+        model.elements = self._extract_elements(ifc_file, model.levels, progress_callback)
+
+        # NEW: Automatically convert doors labeled "exit" into virtual exit spaces
+        for element in list(model.elements.values()):
+            if element.category == ElementCategory.DOOR:
+                name_lower = element.name.lower()
+                props_lower = " ".join([str(v).lower() for v in element.properties.values()])
+                if "exit" in name_lower or "exit" in props_lower:
+                    v_id = f"virt_exit_{element.id}"
+                    model.spaces[v_id] = BIMSpace(
+                        id=v_id,
+                        global_id=f"virt_{element.global_id}",
+                        name=f"{element.name} (Exit Door)",
+                        level=element.level,
+                        center=element.center,
+                        geometry=element.geometry,
+                        category="exit",
+                        occupancy_capacity=20
+                    )
 
         # Validate model
         logger.info("Validating model...")
@@ -211,17 +258,29 @@ class BIMProcessor:
 
         return levels
 
-    def _extract_spaces(self, ifc_file, levels: Dict[str, BIMLevel]) -> Dict[str, BIMSpace]:
+    def _extract_spaces(self, ifc_file, levels: Dict[str, BIMLevel], progress_callback=None) -> Dict[str, BIMSpace]:
         """Extract spaces/rooms from IFC."""
         spaces = {}
+        
+        ifc_spaces = ifc_file.by_type("IfcSpace")
+        total = len(ifc_spaces)
 
-        for space in ifc_file.by_type("IfcSpace"):
+        for i, space in enumerate(ifc_spaces):
+            if progress_callback and i % 5 == 0:
+                progress_callback(f"Extracting spaces ({i}/{total})...", 20 + int((i/total)*20))
             # Get level
             level_id = ""
             for rel in getattr(space, "ContainedInStructure", []) or []:
                 if rel and hasattr(rel, "RelatingStructure"):
                     level_id = str(rel.RelatingStructure.id())
                     break
+            
+            # Spaces often decompose the storey instead of being contained in it
+            if not level_id:
+                for rel in getattr(space, "Decomposes", []) or []:
+                    if rel and hasattr(rel, "RelatingObject"):
+                        level_id = str(rel.RelatingObject.id())
+                        break
 
             # Get area and volume from quantities
             area = 0.0
@@ -323,7 +382,7 @@ class BIMProcessor:
 
         return "space"
 
-    def _extract_elements(self, ifc_file, levels: Dict[str, BIMLevel]) -> Dict[str, BIMElement]:
+    def _extract_elements(self, ifc_file, levels: Dict[str, BIMLevel], progress_callback=None) -> Dict[str, BIMElement]:
         """Extract building elements from IFC."""
         elements = {}
 
@@ -337,14 +396,21 @@ class BIMProcessor:
             "IfcTransportElement", "IfcBuildingElementProxy"
         ]
 
+        all_elems = []
         for element_type in relevant_types:
-            for elem in ifc_file.by_type(element_type):
-                try:
-                    bim_element = self._process_element(elem, levels)
-                    if bim_element:
-                        elements[bim_element.id] = bim_element
-                except Exception as e:
-                    logger.warning(f"Error processing element {elem.id()}: {e}")
+            all_elems.extend(ifc_file.by_type(element_type))
+            
+        total = len(all_elems)
+
+        for i, elem in enumerate(all_elems):
+            if progress_callback and i % 10 == 0:
+                progress_callback(f"Extracting elements ({i}/{total})...", 40 + int((i/total)*40))
+            try:
+                bim_element = self._process_element(elem, levels)
+                if bim_element:
+                    elements[bim_element.id] = bim_element
+            except Exception as e:
+                logger.warning(f"Error processing element {elem.id()}: {e}")
 
         return elements
 
@@ -433,6 +499,11 @@ class BIMProcessor:
 
     def _get_element_geometry_and_bounds(self, elem) -> Tuple[Optional[Dict], Optional[Tuple], Optional[Tuple]]:
         """Get full geometry, bounding box and center of an element."""
+        if hasattr(self, "_geometry_cache") and getattr(elem, "GlobalId", None) in self._geometry_cache:
+            return self._geometry_cache[elem.GlobalId]
+            
+
+
         try:
             shape = ifcopenshell.geom.create_shape(self.settings, elem)
             if shape:
@@ -447,8 +518,10 @@ class BIMProcessor:
                         pv_faces.extend([3, faces[i], faces[i+1], faces[i+2]])
                     geometry = {"vertices": verts.tolist(), "faces": pv_faces}
                     return geometry, (min_bounds, max_bounds), center
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            print("INTERNAL GEOMETRY EXCEPTION:", type(e), e)
+            # traceback.print_exc()
         return None, None, None
 
     def _get_element_properties(self, elem) -> Dict[str, Any]:
@@ -505,30 +578,34 @@ class BIMProcessor:
             if not elements:
                 report["warnings"].append(f"Missing {req_type}")
 
-        # Check geometry
+        # Check geometry and duplicate GlobalIds using extracted elements
         elements_with_geom = 0
         elements_without_geom = 0
-        for elem in ifc_file.by_type("IfcProduct"):
-            if elem.Representation:
+        global_ids = {}
+
+        for elem in model.elements.values():
+            if elem.geometry:
                 elements_with_geom += 1
             else:
                 elements_without_geom += 1
+                
+            gid = elem.global_id
+            if gid in global_ids:
+                report["errors"].append(f"Duplicate GlobalId: {gid}")
+            global_ids[gid] = elem.id
 
         report["stats"]["elements_with_geometry"] = elements_with_geom
         report["stats"]["elements_without_geometry"] = elements_without_geom
 
         # Check for spaces
-        spaces = ifc_file.by_type("IfcSpace")
-        if not spaces:
+        if not model.spaces:
             report["warnings"].append("No spaces found in model")
-
-        # Check for duplicate GlobalIds
-        global_ids = {}
-        for elem in ifc_file.by_type("IfcRoot"):
-            gid = elem.GlobalId
+        
+        for space in model.spaces.values():
+            gid = space.global_id
             if gid in global_ids:
                 report["errors"].append(f"Duplicate GlobalId: {gid}")
-            global_ids[gid] = elem.id()
+            global_ids[gid] = space.id
 
         report["stats"]["total_elements"] = len(model.elements)
         report["stats"]["total_spaces"] = len(model.spaces)
@@ -536,14 +613,6 @@ class BIMProcessor:
         report["stats"]["unique_global_ids"] = len(global_ids)
 
         return report
-
-    def get_element_geometry(self, element_id: str) -> Optional[Dict]:
-        """Get geometry data for visualization."""
-        if not self.current_model or element_id not in self.current_model.elements:
-            return None
-
-        element = self.current_model.elements[element_id]
-        return element.geometry
 
     def get_spaces_by_level(self, level_id: str) -> List[BIMSpace]:
         """Get all spaces on a specific level."""
